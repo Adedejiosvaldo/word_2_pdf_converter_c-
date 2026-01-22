@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "dgSpecHash": "0yWnoe0QG0Q=",
+  "success": true,
+  "projectFilePath": "/home/bluebird/coding_folder/backend/word_2_pdf/word_2_pdf.csproj",
+  "expectedPackageFiles": [
+    "/home/bluebird/.nuget/packages/docx/5.0.0/docx.5.0.0.nupkg.sha512",
+    "/home/bluebird/.nuget/packages/questpdf/2025.12.3/questpdf.2025.12.3.nupkg.sha512",
+    "/home/bluebird/.nuget/packages/skiasharp/2.88.8/skiasharp.2.88.8.nupkg.sha512",
+    "/home/bluebird/.nuget/packages/skiasharp.nativeassets.macos/2.88.8/skiasharp.nativeassets.macos.2.88.8.nupkg.sha512",
+    "/home/bluebird/.nuget/packages/skiasharp.nativeassets.win32/2.88.8/skiasharp.nativeassets.win32.2.88.8.nupkg.sha512",
+    "/home/bluebird/.nuget/packages/system.io.packaging/4.5.0/system.io.packaging.4.5.0.nupkg.sha512",
+    "/home/bluebird/.nuget/packages/microsoft.aspnetcore.app.ref/10.0.0/microsoft.aspnetcore.app.ref.10.0.0.nupkg.sha512"
+  ],
+  "logs": []
+}
