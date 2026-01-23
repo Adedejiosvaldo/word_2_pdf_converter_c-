@@ -59,20 +59,148 @@ try
                 page.PageColor(Colors.White);
                 page.DefaultTextStyle(x => x.FontSize(11).FontFamily("Calibri"));
 
+
+                // List
                 // adding page content
                 page.Content().Column(column =>
                 {
+                    int numberListCounter = 0;
+                    ListItemType? currentListType = null;
                     foreach (var paragraph in wordDocument.Paragraphs)
                     {
-                        string text = paragraph.Text;
-
-                        if (string.IsNullOrEmpty(text))
+                        if (string.IsNullOrEmpty(paragraph.Text))
                         {
                             column.Item().PaddingBottom(5);
                             continue;
                         }
 
-                        column.Item().Text(text);
+                        // check heading
+                        var startsWithNumber = paragraph.Text?.Length > 0 && char.IsDigit(paragraph.Text[0]);
+                        var IsHeading = paragraph.StyleId.Contains("Heading") == true ||
+                        (paragraph.Text?.All(char.IsUpper) == true && paragraph.Text.Length < 100 && paragraph.Text.Length > 3) ||
+                        (startsWithNumber && paragraph.Text?.Length < 100);
+
+
+                        if (IsHeading)
+                        {
+                            column.Item().Text(text =>
+                            {
+                                text.Span(paragraph.Text).Bold().FontSize(14);
+                            });
+                            continue;
+                        }
+
+
+                        if (paragraph.IsListItem)
+                        {
+                            var indent = paragraph.IndentLevel * 10;
+
+                            if (paragraph.ListItemType == ListItemType.Numbered)
+                            {
+                                if (currentListType != ListItemType.Numbered)
+                                {
+                                    numberListCounter = 0;
+                                }
+                                currentListType = ListItemType.Numbered;
+                                numberListCounter++;
+                            }
+                            else
+                            {
+                                currentListType = ListItemType.Bulleted;
+                            }
+
+                            column.Item().Row(row =>
+                            {
+                                row.ConstantItem(30).Text(paragraph.ListItemType == ListItemType.Numbered ? $"{numberListCounter}." : "•").Bold();
+                                row.RelativeItem().PaddingLeft((float)indent).Text(text =>
+                                {
+                                    var alignment = paragraph.Alignment;
+                                    foreach (var run in paragraph.MagicText)
+                                    {
+                                        if (string.IsNullOrEmpty(run.text)) continue;
+                                        var textSpan = text.Span(run.text);
+
+                                        // applying style
+                                        if (run.formatting?.Bold == true) { textSpan.Bold(); }
+                                        if (run.formatting?.Italic == true) { textSpan.Italic(); }
+                                        if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) { textSpan.Underline(); }
+
+                                        if (run.formatting?.FontFamily != null)
+                                        {
+                                            textSpan.FontFamily(run.formatting.FontFamily.ToString());
+                                        }
+
+                                        if (run.formatting?.FontColor.HasValue == true)
+                                        {
+                                            var color = run.formatting.FontColor.Value;
+                                            textSpan.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
+                                        }
+                                    }
+
+                                    if (alignment == Alignment.left) { text.AlignLeft(); }
+                                    else if (alignment == Alignment.center) { text.AlignCenter(); }
+                                    else if (alignment == Alignment.right) { text.AlignRight(); }
+                                    else if (alignment == Alignment.both) { text.Justify(); }
+                                });
+                            });
+                            continue; // Skip regular paragraph processing for list items
+                        }
+
+
+                        if (!paragraph.IsListItem && !IsHeading)
+                        {
+                            currentListType = null;
+                            numberListCounter = 0;
+                        }
+
+                        // regular paragraph
+                        column.Item().Text(text =>
+                        {
+                            var alignment = paragraph.Alignment;
+                            foreach (var run in paragraph.MagicText)
+                            {
+                                if (string.IsNullOrEmpty(run.text)) continue;
+                                // starting the text
+                                var textSpan = text.Span(run.text);
+
+                                // applying style
+                                if (run.formatting?.Bold == true) { textSpan.Bold(); }
+
+                                if (run.formatting?.Italic == true) { textSpan.Italic(); }
+
+                                if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) { textSpan.Underline(); }
+
+                                if (run.formatting?.FontFamily != null)
+                                {
+                                    textSpan.FontFamily(run.formatting.FontFamily.ToString());
+                                }
+
+                                if (run.formatting?.FontColor.HasValue == true)
+                                {
+                                    var color = run.formatting.FontColor.Value;
+                                    textSpan.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
+                                }
+                            }
+
+                            if (alignment == Alignment.left)
+                            {
+                                text.AlignLeft();
+                            }
+                            else if (alignment == Alignment.center)
+                            {
+                                text.AlignCenter();
+                            }
+                            else if (alignment == Alignment.right)
+                            {
+                                text.AlignRight();
+                            }
+                            else if (alignment == Alignment.both)
+                            {
+                                text.Justify();
+                            }
+                        });
+                        // string text = paragraph.Text;
+
                     }
                 });
             });
