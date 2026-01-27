@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("word_2_pdf")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+64024c9da093844cc17bfc73319845e5441d0529")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+2879ebf06a9beef68ac609be7fc52b8965f6e7cb")]
 [assembly: System.Reflection.AssemblyProductAttribute("word_2_pdf")]
 [assembly: System.Reflection.AssemblyTitleAttribute("word_2_pdf")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
