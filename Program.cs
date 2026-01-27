@@ -60,12 +60,22 @@ try
                 page.PageColor(Colors.White);
                 page.DefaultTextStyle(x => x.FontSize(12).FontFamily("Century Gothic"));
 
-                page.Footer().AlignCenter().Text(text =>
+                // WHY: Enhanced footer with company information
+                page.Footer().Column(footerColumn =>
                 {
-                    text.CurrentPageNumber().FontSize(8);
-                    text.Span(" of ").FontSize(8);
-                    text.TotalPages().FontSize(8);
-
+                    // WHY: Company name on the left
+                    footerColumn.Item().AlignLeft().Text("ZENITH GENERAL INSURANCE CO. LTD").FontSize(8);
+                    
+                    // WHY: Page numbers in the center
+                    footerColumn.Item().AlignCenter().Text(text =>
+                    {
+                        text.CurrentPageNumber().FontSize(8);
+                        text.Span(" of ").FontSize(8);
+                        text.TotalPages().FontSize(8);
+                    });
+                    
+                    // WHY: Regulatory information at the bottom center
+                    footerColumn.Item().AlignCenter().Text("Authorised and regulated by the National Insurance Commission [RIC-048]").FontSize(7);
                 });
 
                 // List
