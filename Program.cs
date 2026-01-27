@@ -74,8 +74,24 @@ try
                 {
                     int numberListCounter = 0;
                     ListItemType? currentListType = null;
+
+                    // Tables
+                    var allTables = wordDocument.Tables;
+                    int tableIndex = 0;
+
+
+
+
                     foreach (var paragraph in wordDocument.Paragraphs)
                     {
+                        // check if the paragraph is in a table
+                        bool isInTable = allTables.Any(t => t.Paragraphs.Contains(paragraph));
+                        if (isInTable)
+                        {
+                            continue;
+                        }
+
+                        // check if the paragraph is in a list
                         if (string.IsNullOrEmpty(paragraph.Text))
                         {
                             column.Item().PaddingBottom(5);
@@ -86,11 +102,11 @@ try
                         var startsWithNumber = paragraph.Text?.Length > 0 && char.IsDigit(paragraph.Text[0]);
 
 
-                        var isNumberedSectionHeading = startsWithNumber && paragraph.Text.Length < 60 && (paragraph.Text.IndexOf(". ") > 0 || paragraph.Text.IndexOf(".") == 1) && !paragraph.Text.Contains("–") && !paragraph.Text.Contains("-") && paragraph.Text.Split(' ').Length <= 8;
+                        var isNumberedSectionHeading = startsWithNumber && paragraph?.Text?.Length < 60 && (paragraph.Text.IndexOf(". ") > 0 || paragraph.Text.IndexOf(".") == 1) && !paragraph.Text.Contains("–") && !paragraph.Text.Contains("-") && paragraph.Text.Split(' ').Length <= 8;
 
-                        var IsHeading = paragraph.StyleId.Contains("Heading") == true ||
-(paragraph.Text?.All(char.IsUpper) == true && paragraph.Text.Length < 100 && paragraph.Text.Length > 3) ||
-isNumberedSectionHeading;
+                        var IsHeading = paragraph?.StyleId?.Contains("Heading") == true ||
+                        (paragraph?.Text?.All(char.IsUpper) == true && paragraph?.Text?.Length < 100 && paragraph?.Text?.Length > 3) ||
+                        isNumberedSectionHeading;
 
 
                         if (IsHeading)
@@ -208,7 +224,8 @@ isNumberedSectionHeading;
                                     else if (alignment == Alignment.both) { text.Justify(); }
                                 });
                             });
-                            continue; // Skip regular paragraph processing for list items
+                            continue;
+                            // Skip regular paragraph processing for list items
                         }
 
 
@@ -305,6 +322,81 @@ isNumberedSectionHeading;
                         });
                         // string text = paragraph.Text;
 
+
+                        // Tables code
+                        foreach (var table in allTables)
+                        {
+                            column.Item().PaddingTop(3).PaddingBottom(3).Table(tableElement =>
+                            {
+                                tableElement.ColumnsDefinition(column =>
+                                {
+                                    for (int i = 0; i < table.ColumnCount; i++)
+                                    {
+                                        column.RelativeColumn();
+                                    }
+                                });
+
+                                // Process each row
+                                foreach (var row in table.Rows)
+                                {
+                                    tableElement.Cell().Row(rowElement =>
+                                    {
+                                        foreach (var cell in row.Cells)
+                                        {
+                                            tableElement.Cell().Padding(5).Column(column =>
+                                            {
+
+                                                foreach (var cellParagraph in cell.Paragraphs)
+                                                {
+
+                                                    if (!string.IsNullOrEmpty(cellParagraph.Text))
+                                                    {
+                                                        column.Item().Text(text =>
+                                                        {
+
+                                                            foreach (var run in cellParagraph.MagicText)
+                                                            {
+
+                                                                if (string.IsNullOrEmpty(run.text)) continue;
+                                                                var textSpan = text.Span(run.text);
+
+                                                                // applying style
+                                                                if (run.formatting?.Bold == true) { textSpan.Bold(); }
+                                                                if (run.formatting?.Italic == true) { textSpan.Italic(); }
+                                                                if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) { textSpan.Underline(); }
+
+                                                                if (run.formatting?.FontFamily != null)
+                                                                {
+                                                                    textSpan.FontFamily(run.formatting.FontFamily.ToString());
+                                                                }
+
+                                                                if (run.formatting?.FontColor.HasValue == true)
+                                                                {
+                                                                    var color = run.formatting.FontColor.Value;
+                                                                    textSpan.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
+                                                                }
+
+                                                                if (cellParagraph.Alignment == Alignment.left) { text.AlignLeft(); }
+                                                                else if (cellParagraph.Alignment == Alignment.center) { text.AlignCenter(); }
+                                                                else if (cellParagraph.Alignment == Alignment.right) { text.AlignRight(); }
+                                                                else if (cellParagraph.Alignment == Alignment.both) { text.Justify(); }
+                                                            }
+                                                        });
+                                                    }
+                                                    {
+
+                                                    }
+                                                }
+
+                                            });
+
+
+                                        }
+                                        ;
+                                    });
+                                }
+                            }); ;
+                        }
                     }
                 });
             });
@@ -324,5 +416,5 @@ catch (Exception ex)
     // throw;
 }
 
-Console.WriteLine("Press anykey to exit");
+Console.WriteLine("Press any key to exit");
 Console.ReadKey();
