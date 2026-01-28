@@ -1,4 +1,3 @@
-﻿using System.ComponentModel;
 using QuestPDF.Infrastructure;
 using Xceed.Words.NET;
 using Xceed.Document.NET;
@@ -6,27 +5,22 @@ using QuestPDF.Helpers;
 using QuestPDF.Fluent;
 
 QuestPDF.Settings.License = LicenseType.Community;
-QuestPDF.Settings.EnableDebugging = true; // WHY: Enable debugging to find layout constraint issues
+// QuestPDF.Settings.EnableDebugging = true;
 
-// Terminal output
 Console.WriteLine("Word 2 PDF Converter");
 Console.WriteLine("----------------------");
 
-// Get word file path
 Console.WriteLine("Enter your file path");
 string? filePath = Console.ReadLine();
 
-// Check if file exists
 if (!File.Exists(filePath))
 {
     Console.WriteLine("No File found");
     return;
 }
 
-// A place to save
 Console.WriteLine("Enter your file path to save");
 string? pdfPath = Console.ReadLine();
-
 
 if (string.IsNullOrEmpty(pdfPath))
 {
@@ -42,540 +36,676 @@ if (!pdfPath.EndsWith(".pdf"))
 Console.WriteLine("Conversion Starting...");
 Console.WriteLine();
 
-
 try
 {
-    using (var wordDocument = DocX.Load(filePath))
+    using var wordDocument = DocX.Load(filePath);
+    Console.WriteLine("Document Loaded");
+
+    // ========================================
+    // STEP 1: Extract dynamic values FIRST
+    // ========================================
+    string policyNumber = string.Empty;
+    string insuredName = string.Empty;
+    string periodFrom = string.Empty;
+    string periodTo = string.Empty;
+
+    foreach (var p in wordDocument.Paragraphs)
     {
-        System.Console.WriteLine("Document Loaded");
+        var text = p.Text?.Trim() ?? string.Empty;
+        if (string.IsNullOrEmpty(text)) continue;
 
-        // creating a PDF
-        QuestPDF.Fluent.Document.Create(container =>
+        // Extract INSURED value
+        if (string.IsNullOrEmpty(insuredName) && text.StartsWith("INSURED:", StringComparison.OrdinalIgnoreCase))
         {
-            container.Page(page =>
+            var parts = text.Split(':', 2);
+            if (parts.Length == 2) insuredName = parts[1].Trim();
+        }
+
+        // Extract POLICY NO value
+        if (string.IsNullOrEmpty(policyNumber))
+        {
+            if (text.StartsWith("POLICY NO:", StringComparison.OrdinalIgnoreCase) ||
+                text.StartsWith("POLICY NUMBER:", StringComparison.OrdinalIgnoreCase))
             {
-                // page configurations
-                page.Size(PageSizes.A4);
-                page.Margin(2, Unit.Centimetre);
-                page.PageColor(Colors.White);
-                page.DefaultTextStyle(x => x.FontSize(12).FontFamily("Century Gothic"));
-
-                // WHY: Enhanced footer with company information
-                page.Footer().Column(footerColumn =>
-                {
-                    // WHY: Company name on the left
-                    footerColumn.Item().AlignLeft().Text("ZENITH GENERAL INSURANCE CO. LTD").FontSize(8);
-                    
-                    // WHY: Page numbers in the center
-                    footerColumn.Item().AlignCenter().Text(text =>
-                    {
-                        text.CurrentPageNumber().FontSize(8);
-                        text.Span(" of ").FontSize(8);
-                        text.TotalPages().FontSize(8);
-                    });
-                    
-                    // WHY: Regulatory information at the bottom center
-                    footerColumn.Item().AlignCenter().Text("Authorised and regulated by the National Insurance Commission [RIC-048]").FontSize(7);
-                });
-
-                // List
-                // adding page content
-                page.Content().Column(column =>
-                {
-                    int numberListCounter = 0;
-                    ListItemType? currentListType = null;
-
-                    // Tables
-                    var allTables = wordDocument.Tables;
-                    int tableIndex = 0;
-
-
-
-
-                    foreach (var paragraph in wordDocument.Paragraphs)
-                    {
-                        // check if the paragraph is in a table
-                        bool isInTable = allTables.Any(t => t.Paragraphs.Contains(paragraph));
-                        if (isInTable)
-                        {
-                            continue;
-                        }
-
-                        // WHY: Check for page breaks in paragraph text
-                        // Page breaks in Word are often represented as form feed characters (\f) or special break characters
-                        // Check if paragraph text contains page break markers
-                        bool isPageBreak = paragraph.Text?.Contains("\f") == true || // Form feed character (page break)
-                                          paragraph.Text?.Contains("\x000c") == true || // Page break character (Unicode)
-                                          paragraph.Text?.Contains("\x0C") == true; // Another form of page break
-
-                        if (isPageBreak)
-                        {
-                            column.Item().PageBreak(); // WHY: Force a new page in QuestPDF
-                            // WHY: Remove the break character from text if it exists, or skip the paragraph
-                            if (paragraph.Text?.Length <= 1) // If paragraph is just the break character
-                            {
-                                continue; // Skip this paragraph entirely
-                            }
-                            // If paragraph has text after break, continue processing but the page break is already added
-                        }
-
-                        // WHY: Check for images in paragraphs first
-                        // Images can be in paragraphs even if there's no text
-                        if (paragraph.Pictures != null && paragraph.Pictures.Count > 0)
-                        {
-                            // WHY: Process each image in the paragraph
-                            foreach (var picture in paragraph.Pictures)
-                            {
-                                try
-                                {
-                                    // WHY: Get image bytes from Word document
-                                    // In Xceed.Words.NET, images are accessed through the document's image parts
-                                    var imageId = picture.Id;
-                                    var imagePart = wordDocument.Images.FirstOrDefault(img => img.Id == imageId);
-
-                                    if (imagePart != null)
-                                    {
-                                        // WHY: Get image bytes from the image part
-                                        // GetStream requires FileMode and FileAccess parameters
-                                        byte[] imageBytes;
-                                        using (var stream = imagePart.GetStream(System.IO.FileMode.Open, System.IO.FileAccess.Read))
-                                        {
-                                            using (var memoryStream = new MemoryStream())
-                                            {
-                                                stream.CopyTo(memoryStream);
-                                                imageBytes = memoryStream.ToArray();
-                                            }
-                                        }
-
-                                        // WHY: Add image to PDF with proper spacing, alignment, and size constraints
-                                        // Images need size constraints to prevent layout conflicts
-                                        // Use FitArea to constrain image to available space
-                                        column.Item()
-                                            .PaddingTop(6)
-                                            .PaddingBottom(6)
-                                            .AlignCenter()
-                                            .Image(imageBytes)
-                                            .FitArea(); // WHY: Constrain image to fit available area, preventing layout conflicts
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    Console.WriteLine($"Warning: Could not load image - {ex.Message}");
-                                }
-                            }
-
-                            // WHY: If paragraph only has images (no text), skip text processing
-                            if (string.IsNullOrEmpty(paragraph.Text))
-                            {
-                                continue;
-                            }
-                            // If paragraph has both images and text, continue to process text below
-                        }
-
-                        // WHY: Skip empty paragraphs to reduce layout complexity
-                        // Empty paragraphs create unnecessary padding elements that can cause layout conflicts
-                        if (string.IsNullOrEmpty(paragraph.Text))
-                        {
-                            // Skip empty paragraphs entirely - don't add padding
-                            continue;
-                        }
-
-                        // check heading
-                        var startsWithNumber = paragraph.Text?.Length > 0 && char.IsDigit(paragraph.Text[0]);
-
-
-                        var isNumberedSectionHeading = startsWithNumber && paragraph?.Text?.Length < 60 && (paragraph.Text.IndexOf(". ") > 0 || paragraph.Text.IndexOf(".") == 1) && !paragraph.Text.Contains("–") && !paragraph.Text.Contains("-") && paragraph.Text.Split(' ').Length <= 8;
-
-                        // WHY: Check if paragraph is a section heading (bold, short, all caps like "IMPORTANT", "PLEASE NOTE")
-                        var isBoldSectionHeading = paragraph?.Text?.All(char.IsUpper) == true &&
-                                                   paragraph.Text.Length < 50 &&
-                                                   paragraph.Text.Length > 3 &&
-                                                   paragraph.MagicText.Any(r => r.formatting?.Bold == true) &&
-                                                   !paragraph.Text.Contains(":"); // Exclude labels like "INSURED:"
-
-                        // WHY: Enhanced heading detection for all-caps titles
-                        // Main titles like "PRODUCT LIABILITY INSURANCE POLICY" should be detected
-                        var IsHeading = paragraph?.StyleId?.Contains("Heading") == true ||
-                        (paragraph?.Text?.All(char.IsUpper) == true && 
-                         paragraph?.Text?.Length < 150 && 
-                         paragraph?.Text?.Length > 5 && // Increased from 3 to catch longer titles
-                         !paragraph.Text.Contains(":") && // Exclude labels like "INSURED:"
-                         paragraph.Text.Split(' ').Length <= 10) || // Allow more words for titles
-                        isNumberedSectionHeading ||
-                        isBoldSectionHeading; // Add bold section heading detection
-
-
-                        if (IsHeading)
-                        {
-                            // we need space for above and below the heading
-                            var alignment = paragraph?.Alignment;
-                            int levelSize = 1;
-                            if (paragraph?.StyleId?.Contains("Heading") == true)
-                            {
-                                var StyleId = paragraph.StyleId;
-                                if (StyleId?.Contains("Heading 1") == true)
-                                {
-                                    levelSize = 1;
-                                }
-                                else if (StyleId?.Contains("Heading 2") == true)
-                                {
-                                    levelSize = 2;
-                                }
-                                else if (StyleId?.Contains("Heading 3") == true)
-                                {
-                                    levelSize = 3;
-                                }
-                                else if (StyleId?.Contains("Heading 4") == true)
-                                {
-                                    levelSize = 4;
-                                }
-                                else if (StyleId?.Contains("Heading 5") == true)
-                                {
-                                    levelSize = 5;
-                                }
-                                else if (StyleId?.Contains("Heading 6") == true)
-                                {
-                                    levelSize = 6;
-                                }
-                                else
-                                {
-                                    levelSize = 1;
-                                }
-                            }
-                            else if (startsWithNumber)
-                            {
-                                levelSize = 2;
-                            }
-                            else
-                            {
-                                levelSize = 1;
-                            }
-
-                            // font calculation
-                            float fontSize = 16 - (levelSize * 2);
-                            column.Item().PaddingTop(6).PaddingBottom(6)
-                            .Text(text =>
-                            {
-                                text.Span(paragraph?.Text).Bold().FontSize(fontSize);
-                                if (alignment == Alignment.left) { text.AlignLeft(); }
-                                else if (alignment == Alignment.center) { text.AlignCenter(); }
-                                else if (alignment == Alignment.right) { text.AlignRight(); }
-                                else if (alignment == Alignment.both) { text.Justify(); }
-                            });
-
-                            continue;
-                        }
-
-
-                        if (paragraph?.IsListItem == true)
-                        {
-                            var indent = paragraph.IndentLevel * 6;
-                            // var indent = paragraph.IndentLevel * 10;
-
-                            if (paragraph.ListItemType == ListItemType.Numbered)
-                            {
-                                if (currentListType != ListItemType.Numbered)
-                                {
-                                    numberListCounter = 0;
-                                }
-                                currentListType = ListItemType.Numbered;
-                                numberListCounter++;
-                            }
-                            else
-                            {
-                                currentListType = ListItemType.Bulleted;
-                            }
-
-                            column.Item().PaddingBottom(6).PaddingTop(6).Row(row =>
-                            {
-                                row.ConstantItem(30).Text(paragraph.ListItemType == ListItemType.Numbered ? $"{numberListCounter}." : "•").Bold();
-                                row.RelativeItem().PaddingLeft((float)indent).Text(text =>
-                                {
-                                    var alignment = paragraph.Alignment;
-                                    foreach (var run in paragraph.MagicText)
-                                    {
-                                        // WHY: Handle line breaks in list items
-                                        if (string.IsNullOrEmpty(run.text))
-                                        {
-                                            if (run.GetType().Name.Contains("Break") || run.GetType().Name.Contains("Line"))
-                                            {
-                                                text.Span("\n"); // WHY: Use newline character for line breaks
-                                            }
-                                            continue;
-                                        }
-
-                                        // WHY: Split text by line breaks
-                                        var textParts = run.text.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
-                                        bool isFirstPart = true;
-
-                                        foreach (var textPart in textParts)
-                                        {
-                                            if (!isFirstPart)
-                                            {
-                                                text.Span("\n"); // WHY: Use newline character for line breaks
-                                            }
-                                            isFirstPart = false;
-
-                                            if (string.IsNullOrEmpty(textPart)) continue;
-
-                                            var textSpan = text.Span(textPart);
-
-                                            // applying style
-                                            if (run.formatting?.Bold == true) { textSpan.Bold(); }
-                                            if (run.formatting?.Italic == true) { textSpan.Italic(); }
-                                            if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) { textSpan.Underline(); }
-
-                                            if (run.formatting?.FontFamily != null)
-                                            {
-                                                textSpan.FontFamily(run.formatting.FontFamily.ToString());
-                                            }
-
-                                            if (run.formatting?.FontColor.HasValue == true)
-                                            {
-                                                var color = run.formatting.FontColor.Value;
-                                                textSpan.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
-                                            }
-                                        }
-                                    }
-
-                                    if (alignment == Alignment.left) { text.AlignLeft(); }
-                                    else if (alignment == Alignment.center) { text.AlignCenter(); }
-                                    else if (alignment == Alignment.right) { text.AlignRight(); }
-                                    else if (alignment == Alignment.both) { text.Justify(); }
-                                });
-                            });
-                            continue;
-                            // Skip regular paragraph processing for list items
-                        }
-
-
-                        if (!paragraph.IsListItem && !IsHeading)
-                        {
-                            currentListType = null;
-                            numberListCounter = 0;
-                        }
-
-                        // regular paragraph
-                        column.Item().PaddingTop(6).PaddingBottom(6).Text(text =>
-                        {
-
-                            var alignment = paragraph.Alignment;
-                            foreach (var run in paragraph.MagicText)
-                            {
-                                // WHY: Check for line breaks in the text
-                                // Line breaks can be \n, \r\n, or represented as separate break elements
-                                if (string.IsNullOrEmpty(run.text))
-                                {
-                                    // WHY: Empty run might be a line break marker
-                                    // Check if this is a break element
-                                    if (run.GetType().Name.Contains("Break") || run.GetType().Name.Contains("Line"))
-                                    {
-                                        text.Span("\n"); // WHY: Add line break in PDF using newline character
-                                    }
-                                    continue;
-                                }
-
-                                // WHY: Check if text contains line break characters
-                                // Split text by line breaks and add each part separately
-                                var textParts = run.text.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
-                                bool isFirstPart = true;
-
-                                foreach (var textPart in textParts)
-                                {
-                                    // WHY: Add line break before each part except the first
-                                    if (!isFirstPart)
-                                    {
-                                        text.Span("\n"); // WHY: Use newline character for line breaks in QuestPDF
-                                    }
-                                    isFirstPart = false;
-
-                                    if (string.IsNullOrEmpty(textPart)) continue;
-                                    // starting the text
-                                    // var textSpan = text.Span(run.text);
-
-                                    // check if the run is a hyperlink
-                                    var hyperLink = paragraph.Hyperlinks.FirstOrDefault(h => h.Text.Contains(textPart));
-
-
-                                    if (hyperLink != null && !string.IsNullOrEmpty(hyperLink.Uri.ToString()))
-                                    {
-                                        var linkSpan = text.Hyperlink(hyperLink.Text, hyperLink.Uri.ToString().AsSpan().ToString());
-
-                                        // styling for indicators
-                                        linkSpan.FontColor(Colors.Blue.Darken1);
-                                        linkSpan.Underline();
-                                        // applying style
-                                        if (run.formatting?.Bold == true) { linkSpan.Bold(); }
-
-                                        if (run.formatting?.Italic == true) { linkSpan.Italic(); }
-
-                                        if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) { linkSpan.Underline(); }
-
-                                        if (run.formatting?.FontFamily != null)
-                                        {
-                                            linkSpan.FontFamily(run.formatting.FontFamily.ToString());
-                                        }
-
-                                        if (run.formatting?.FontColor.HasValue == true)
-                                        {
-                                            var color = run.formatting.FontColor.Value;
-                                            linkSpan.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
-                                        }
-                                    }
-                                    else
-                                    {
-                                        // regular text - use textPart instead of run.text
-                                        var regtextSpan = text.Span(textPart);
-
-                                        // applying style
-                                        if (run.formatting?.Bold == true) { regtextSpan.Bold(); }
-
-                                        if (run.formatting?.Italic == true) { regtextSpan.Italic(); }
-
-                                        if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) { regtextSpan.Underline(); }
-
-                                        if (run.formatting?.FontFamily != null)
-                                        {
-                                            regtextSpan.FontFamily(run.formatting.FontFamily.ToString());
-                                        }
-
-                                        if (run.formatting?.FontColor.HasValue == true)
-                                        {
-                                            var color = run.formatting.FontColor.Value;
-                                            regtextSpan.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
-                                        }
-                                    }
-                                }
-
-                            }
-
-                            if (alignment == Alignment.left)
-                            {
-                                text.AlignLeft();
-                            }
-                            else if (alignment == Alignment.center)
-                            {
-                                text.AlignCenter();
-                            }
-                            else if (alignment == Alignment.right)
-                            {
-                                text.AlignRight();
-                            }
-                            else if (alignment == Alignment.both)
-                            {
-                                text.Justify();
-                            }
-                        });
-                        // string text = paragraph.Text;
-                    }
-
-                    // WHY: Process all tables after paragraphs
-                    // Tables are separate from paragraphs in Word documents
-                    foreach (var table in allTables)
-                    {
-                        // WHY: Limit table columns to prevent layout issues
-                        // Too many columns can cause width constraint conflicts
-                        int columnCount = Math.Min(table.ColumnCount, 10); // Max 10 columns to prevent issues
-
-                        column.Item().PaddingTop(6).PaddingBottom(6).Table(tableElement =>
-                        {
-                            // WHY: Define table columns - equal width for all columns
-                            tableElement.ColumnsDefinition(columns =>
-                            {
-                                for (int i = 0; i < columnCount; i++)
-                                {
-                                    columns.RelativeColumn(); // Equal width columns
-                                }
-                            });
-
-                            // WHY: Process each row in the table
-                            foreach (var row in table.Rows)
-                            {
-                                tableElement.Cell().Row(rowElement =>
-                                {
-                                    // WHY: Process each cell in the row
-                                    // In QuestPDF, use RelativeItem() for each cell in the row
-                                    // Limit cells to match column count to prevent mismatches
-                                    int cellIndex = 0;
-                                    foreach (var cell in row.Cells)
-                                    {
-                                        if (cellIndex >= columnCount) break; // WHY: Prevent too many cells
-
-                                        rowElement.RelativeItem().Padding(5).Column(cellColumn =>
-                                        {
-                                            // WHY: Process paragraphs in each cell
-                                            foreach (var cellParagraph in cell.Paragraphs)
-                                            {
-                                                if (!string.IsNullOrEmpty(cellParagraph.Text))
-                                                {
-                                                    cellColumn.Item().Text(text =>
-                                                    {
-                                                        // WHY: Process text runs in cell
-                                                        foreach (var run in cellParagraph.MagicText)
-                                                        {
-                                                            if (string.IsNullOrEmpty(run.text)) continue;
-
-                                                            var textSpan = text.Span(run.text);
-
-                                                            // applying style
-                                                            if (run.formatting?.Bold == true) { textSpan.Bold(); }
-                                                            if (run.formatting?.Italic == true) { textSpan.Italic(); }
-                                                            if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) { textSpan.Underline(); }
-
-                                                            if (run.formatting?.FontFamily != null)
-                                                            {
-                                                                textSpan.FontFamily(run.formatting.FontFamily.ToString());
-                                                            }
-
-                                                            if (run.formatting?.FontColor.HasValue == true)
-                                                            {
-                                                                var color = run.formatting.FontColor.Value;
-                                                                textSpan.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
-                                                            }
-                                                        }
-
-                                                        // WHY: Alignment should be OUTSIDE the run loop
-                                                        // Apply alignment once per paragraph, not per run
-                                                        if (cellParagraph.Alignment == Alignment.left) { text.AlignLeft(); }
-                                                        else if (cellParagraph.Alignment == Alignment.center) { text.AlignCenter(); }
-                                                        else if (cellParagraph.Alignment == Alignment.right) { text.AlignRight(); }
-                                                        else if (cellParagraph.Alignment == Alignment.both) { text.Justify(); }
-                                                    });
-                                                }
-                                            }
-                                        });
-                                        cellIndex++;
-                                    }
-                                });
-                            }
-                        });
-                    }
-                });
-            });
-        }).GeneratePdf(pdfPath);
-
-        string fullPath = Path.GetFullPath(pdfPath);
-        Console.WriteLine($"✓ PDF saved to: {fullPath}");
+                var parts = text.Split(':', 2);
+                if (parts.Length == 2) policyNumber = parts[1].Trim();
+            }
+        }
+
+        // Extract FROM date
+        if (string.IsNullOrEmpty(periodFrom) && text.Contains("FROM:", StringComparison.OrdinalIgnoreCase))
+        {
+            var fromIdx = text.IndexOf("FROM:", StringComparison.OrdinalIgnoreCase);
+            if (fromIdx >= 0)
+            {
+                var afterFrom = text.Substring(fromIdx + 5).Trim();
+                // Take until next label or end
+                var toIdx = afterFrom.IndexOf("TO:", StringComparison.OrdinalIgnoreCase);
+                periodFrom = toIdx > 0 ? afterFrom.Substring(0, toIdx).Trim() : afterFrom.Trim();
+            }
+        }
+
+        // Extract TO date
+        if (string.IsNullOrEmpty(periodTo) && text.Contains("TO:", StringComparison.OrdinalIgnoreCase))
+        {
+            var toIdx = text.IndexOf("TO:", StringComparison.OrdinalIgnoreCase);
+            if (toIdx >= 0)
+            {
+                periodTo = text.Substring(toIdx + 3).Trim();
+            }
+        }
     }
 
+    Console.WriteLine($"Extracted - INSURED: {insuredName}");
+    Console.WriteLine($"Extracted - POLICY NO: {policyNumber}");
+    Console.WriteLine($"Extracted - FROM: {periodFrom}");
+    Console.WriteLine($"Extracted - TO: {periodTo}");
+
+    // ========================================
+    // STEP 2: Track tables and special sections
+    // ========================================
+    var allTables = wordDocument.Tables.ToList();
+    var paragraphsInTables = new HashSet<Paragraph>();
+    foreach (var table in allTables)
+    {
+        foreach (var p in table.Paragraphs)
+        {
+            paragraphsInTables.Add(p);
+        }
+    }
+
+    // ========================================
+    // STEP 3: Create PDF Document
+    // ========================================
+    QuestPDF.Fluent.Document.Create(container =>
+    {
+        container.Page(page =>
+        {
+            page.Size(PageSizes.A4);
+            page.Margin(2, Unit.Centimetre);
+            page.PageColor(Colors.White);
+            page.DefaultTextStyle(x => x.FontSize(11).FontFamily("Arial"));
+
+            // HEADER: Policy number (page 2+ only)
+            page.Header()
+                .ShowIf(ctx => ctx.PageNumber > 1)
+                .AlignRight()
+                .Text($"POLICY NO: {policyNumber}")
+                .FontSize(9);
+
+            // FOOTER: Only show from page 1 (but hide line on page 1 if desired)
+            page.Footer()
+                .ShowIf(ctx => ctx.PageNumber > 0) // Show on all pages
+                .Column(footerColumn =>
+                {
+                    footerColumn.Item().PaddingBottom(4).LineHorizontal(0.5f).LineColor(Colors.Black);
+
+                    footerColumn.Item().Row(row =>
+                    {
+                        row.RelativeItem().AlignLeft().Text("ZENITH GENERAL INSURANCE CO. LTD").FontSize(8);
+                        row.RelativeItem().AlignCenter().Text(text =>
+                        {
+                            text.CurrentPageNumber().FontSize(8);
+                        });
+                        row.RelativeItem().AlignRight().Text(insuredName).FontSize(8);
+                    });
+
+                    footerColumn.Item().PaddingTop(4).AlignCenter()
+                        .Text("Authorised and regulated by the National Insurance Commission [RIC-048]")
+                        .FontSize(7);
+                });
+
+            // CONTENT
+            page.Content().Column(column =>
+        {
+            int numberListCounter = 0;
+            ListItemType? currentListType = null;
+            int currentIndentLevel = -1;
+            bool insideImportantSection = false;
+            List<Paragraph> importantParagraphs = new();
+
+            foreach (var paragraph in wordDocument.Paragraphs)
+            {
+                if (paragraphsInTables.Contains(paragraph))
+                    continue;
+
+                var paragraphText = paragraph.Text?.Trim() ?? string.Empty;
+
+                // ========================================
+                // PAGE BREAKS
+                // ========================================
+                if (paragraph.Text?.Contains("\f") == true || paragraph.Text?.Contains("\x0C") == true)
+                {
+                    // If we were collecting IMPORTANT paragraphs, render the box first
+                    if (insideImportantSection && importantParagraphs.Count > 0)
+                    {
+                        RenderImportantBox(column, importantParagraphs);
+                        importantParagraphs.Clear();
+                        insideImportantSection = false;
+                    }
+
+                    column.Item().PageBreak();
+                    if (string.IsNullOrWhiteSpace(paragraph.Text?.Replace("\f", "").Replace("\x0C", "")))
+                        continue;
+                }
+
+                // ========================================
+                // IMAGES
+                // ========================================
+                if (paragraph.Pictures != null && paragraph.Pictures.Count > 0)
+                {
+                    foreach (var picture in paragraph.Pictures)
+                    {
+                        try
+                        {
+                            var imageId = picture.Id;
+                            var imagePart = wordDocument.Images.FirstOrDefault(img => img.Id == imageId);
+
+                            if (imagePart != null)
+                            {
+                                using var stream = imagePart.GetStream(FileMode.Open, FileAccess.Read);
+                                using var memoryStream = new MemoryStream();
+                                stream.CopyTo(memoryStream);
+                                var imageBytes = memoryStream.ToArray();
+
+                                if (imageBytes.Length > 0)
+                                {
+                                    column.Item()
+                                        .PaddingVertical(8)
+                                        .AlignCenter()
+                                        .MaxWidth(150) // Logo size
+                                        .Image(imageBytes);
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Warning: Could not load image - {ex.Message}");
+                        }
+                    }
+
+                    if (string.IsNullOrWhiteSpace(paragraphText))
+                        continue;
+                }
+
+                // Skip empty paragraphs
+                if (string.IsNullOrWhiteSpace(paragraphText))
+                {
+                    column.Item().Height(6);
+                    continue;
+                }
+
+                // ========================================
+                // DETECT IMPORTANT SECTION START
+                // ========================================
+                if (paragraphText.Equals("IMPORTANT", StringComparison.OrdinalIgnoreCase))
+                {
+                    insideImportantSection = true;
+                    importantParagraphs.Add(paragraph);
+                    continue;
+                }
+
+                // If inside IMPORTANT section, collect paragraphs until page break or specific markers
+                if (insideImportantSection)
+                {
+                    // Check for end markers (like next main section or page break indicator)
+                    bool isEndOfImportant = paragraphText.StartsWith("POLICY NO:", StringComparison.OrdinalIgnoreCase) ||
+                                            paragraphText.Contains("HEALTHCARE PROFESSIONAL") ||
+                                            paragraphText.Contains("PRODUCT LIABILITY") ||
+                                            (paragraphText.All(c => char.IsUpper(c) || char.IsWhiteSpace(c)) &&
+                                             paragraphText.Length > 20 &&
+                                             !paragraphText.Contains("ZENITH"));
+
+                    if (isEndOfImportant)
+                    {
+                        // Render the IMPORTANT box and continue with this paragraph normally
+                        RenderImportantBox(column, importantParagraphs);
+                        importantParagraphs.Clear();
+                        insideImportantSection = false;
+                        // Fall through to process this paragraph
+                    }
+                    else
+                    {
+                        importantParagraphs.Add(paragraph);
+                        continue;
+                    }
+                }
+
+                // ========================================
+                // LABEL-VALUE PAIRS (INSURED:, POLICY NUMBER:, etc.)
+                // ========================================
+                if (IsLabelValuePair(paragraphText))
+                {
+                    RenderLabelValuePair(column, paragraph);
+                    continue;
+                }
+
+                // ========================================
+                // PERIOD OF INSURANCE (multi-line handling)
+                // ========================================
+                if (paragraphText.StartsWith("PERIOD OF", StringComparison.OrdinalIgnoreCase))
+                {
+                    column.Item().PaddingTop(8).PaddingBottom(4).Row(row =>
+                    {
+                        row.ConstantItem(140).Text(text =>
+                        {
+                            text.Span("PERIOD OF").Bold();
+                        });
+                        row.RelativeItem(); // Empty for this line
+                    });
+                    continue;
+                }
+
+                if (paragraphText.StartsWith("INSURANCE:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var value = paragraphText.Substring(10).Trim();
+                    column.Item().PaddingBottom(4).Row(row =>
+                    {
+                        row.ConstantItem(140).Text(text =>
+                        {
+                            text.Span("INSURANCE:").Bold();
+                        });
+                        row.RelativeItem().Text(value);
+                    });
+                    continue;
+                }
+
+                // Handle standalone FROM: and TO: lines
+                if (paragraphText.StartsWith("FROM:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var value = paragraphText.Substring(5).Trim();
+                    column.Item().PaddingBottom(2).PaddingLeft(140).Text($"FROM: {value}");
+                    continue;
+                }
+
+                if (paragraphText.StartsWith("TO:", StringComparison.OrdinalIgnoreCase) && paragraphText.Length < 50)
+                {
+                    var value = paragraphText.Substring(3).Trim();
+                    column.Item().PaddingBottom(4).PaddingLeft(140).Text($"TO: {value}");
+                    continue;
+                }
+
+                // ========================================
+                // MAIN TITLES (all caps, centered)
+                // ========================================
+                bool isStyleHeading = paragraph.StyleId?.Contains("Heading") == true;
+                bool isAllCapsTitle = paragraphText.Length > 10 &&
+                                      paragraphText.Length < 100 &&
+                                      paragraphText.All(c => char.IsUpper(c) || char.IsWhiteSpace(c) || char.IsPunctuation(c)) &&
+                                      !paragraphText.Contains(":");
+
+                if (isStyleHeading || isAllCapsTitle)
+                {
+                    currentListType = null;
+                    numberListCounter = 0;
+
+                    var alignment = paragraph.Alignment;
+                    float fontSize = 14;
+                    float paddingTop = 10;
+                    float paddingBottom = 6;
+
+                    if (isStyleHeading && paragraph.StyleId != null)
+                    {
+                        if (paragraph.StyleId.Contains("1")) fontSize = 16;
+                        else if (paragraph.StyleId.Contains("2")) fontSize = 14;
+                        else if (paragraph.StyleId.Contains("3")) fontSize = 13;
+                        else fontSize = 12;
+                    }
+                    else if (isAllCapsTitle)
+                    {
+                        fontSize = 16;
+                        paddingTop = 16;
+                        paddingBottom = 12;
+                        alignment = Alignment.center;
+                    }
+
+                    column.Item().PaddingTop(paddingTop).PaddingBottom(paddingBottom).Text(text =>
+                    {
+                        text.Span(paragraphText).Bold().FontSize(fontSize);
+                        ApplyAlignment(text, alignment);
+                    });
+                    continue;
+                }
+
+                // ========================================
+                // SECTION HEADINGS (Bold, short)
+                // ========================================
+                bool isBoldShort = paragraphText.Length < 60 &&
+                                   paragraph.MagicText.Count > 0 &&
+                                   paragraph.MagicText.All(r => r.formatting?.Bold == true);
+
+                if (isBoldShort && !paragraph.IsListItem)
+                {
+                    column.Item().PaddingTop(10).PaddingBottom(4).Text(text =>
+                    {
+                        text.Span(paragraphText).Bold().FontSize(12);
+                        ApplyAlignment(text, paragraph.Alignment);
+                    });
+                    continue;
+                }
+
+                // ========================================
+                // LIST ITEMS
+                // ========================================
+                if (paragraph.IsListItem)
+                {
+                    int indentLevel = paragraph.IndentLevel ?? 0;
+                    float indent = indentLevel * 15f;
+
+                    if (paragraph.ListItemType == ListItemType.Numbered)
+                    {
+                        if (currentListType != ListItemType.Numbered || currentIndentLevel != indentLevel)
+                        {
+                            numberListCounter = 0;
+                        }
+                        currentListType = ListItemType.Numbered;
+                        currentIndentLevel = indentLevel;
+                        numberListCounter++;
+                    }
+                    else
+                    {
+                        currentListType = ListItemType.Bulleted;
+                        currentIndentLevel = indentLevel;
+                    }
+
+                    string marker = paragraph.ListItemType == ListItemType.Numbered
+                        ? $"{numberListCounter})"
+                        : "•";
+
+                    column.Item().PaddingTop(3).PaddingBottom(3).PaddingLeft(indent).Row(row =>
+                    {
+                        row.ConstantItem(25).Text(marker).FontSize(11);
+                        row.RelativeItem().Text(text =>
+                        {
+                            ProcessTextRuns(text, paragraph);
+                            ApplyAlignment(text, paragraph.Alignment);
+                        });
+                    });
+                    continue;
+                }
+
+                // Reset list counter for non-list items
+                if (currentListType != null)
+                {
+                    currentListType = null;
+                    numberListCounter = 0;
+                    currentIndentLevel = -1;
+                }
+
+                // ========================================
+                // REGULAR PARAGRAPHS
+                // ========================================
+                column.Item().PaddingTop(3).PaddingBottom(3).Text(text =>
+                {
+                    ProcessTextRuns(text, paragraph);
+                    ApplyAlignment(text, paragraph.Alignment);
+                });
+            }
+
+            // Render any remaining IMPORTANT section
+            if (insideImportantSection && importantParagraphs.Count > 0)
+            {
+                RenderImportantBox(column, importantParagraphs);
+            }
+
+            // ========================================
+            // TABLES
+            // ========================================
+            foreach (var table in allTables)
+            {
+                int columnCount = table.ColumnCount;
+                if (columnCount <= 0) continue;
+
+                column.Item().PaddingVertical(8).Table(tableElement =>
+                {
+                    tableElement.ColumnsDefinition(columns =>
+                    {
+                        for (int i = 0; i < columnCount; i++)
+                        {
+                            columns.RelativeColumn();
+                        }
+                    });
+
+                    foreach (var row in table.Rows)
+                    {
+                        int cellIdx = 0;
+                        foreach (var cell in row.Cells)
+                        {
+                            if (cellIdx >= columnCount) break;
+
+                            var rowIndex = table.Rows.IndexOf(row);
+                            tableElement.Cell()
+                                .Row((uint)(rowIndex >= 0 ? rowIndex + 1 : 1))
+                                .Column((uint)(cellIdx + 1))
+                                .Border(0.5f)
+                                .BorderColor(Colors.Black)
+                                .Padding(5)
+                                .Column(cellColumn =>
+                                {
+                                    foreach (var cellParagraph in cell.Paragraphs)
+                                    {
+                                        var cellText = cellParagraph.Text?.Trim() ?? string.Empty;
+                                        if (string.IsNullOrEmpty(cellText)) continue;
+
+                                        cellColumn.Item().Text(text =>
+                                        {
+                                            foreach (var run in cellParagraph.MagicText)
+                                            {
+                                                if (string.IsNullOrEmpty(run.text)) continue;
+                                                var span = text.Span(run.text);
+                                                if (run.formatting?.Bold == true) span.Bold();
+                                                if (run.formatting?.Italic == true) span.Italic();
+                                                if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) span.Underline();
+                                            }
+                                            ApplyAlignment(text, cellParagraph.Alignment);
+                                        });
+                                    }
+                                });
+                            cellIdx++;
+                        }
+                    }
+                });
+            }
+        });
+        });
+    }).GeneratePdf(pdfPath);
+
+    string fullPath = Path.GetFullPath(pdfPath);
+    Console.WriteLine($"✓ PDF saved to: {fullPath}");
     Console.WriteLine("Conversion completed successfully!");
-
-
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"Error: {ex.Message}");
-    // throw;
+    Console.WriteLine($"Error: {ex.ToString()}");
 }
 
 Console.WriteLine("Press any key to exit");
-// WHY: Only read key if console input is available (not redirected)
-try
+try { Console.ReadKey(); } catch (InvalidOperationException) { }
+
+// ========================================
+// HELPER FUNCTIONS
+// ========================================
+
+static bool IsLabelValuePair(string text)
 {
-    Console.ReadKey();
+    // Check for common label patterns
+    string[] labels = { "INSURED:", "POLICY NUMBER:", "POLICY NO:" };
+    foreach (var label in labels)
+    {
+        if (text.StartsWith(label, StringComparison.OrdinalIgnoreCase))
+            return true;
+    }
+    return false;
 }
-catch (InvalidOperationException)
+
+static void RenderLabelValuePair(ColumnDescriptor column, Paragraph paragraph)
 {
-    // Console input not available (e.g., when running via script)
-    // Just exit silently
+    var text = paragraph.Text?.Trim() ?? string.Empty;
+    var colonIdx = text.IndexOf(':');
+    if (colonIdx < 0) return;
+
+    var label = text.Substring(0, colonIdx + 1);
+    var value = text.Substring(colonIdx + 1).Trim();
+
+    column.Item().PaddingTop(6).PaddingBottom(4).Row(row =>
+    {
+        row.ConstantItem(140).Text(t => t.Span(label).Bold());
+        row.RelativeItem().Text(t =>
+        {
+            t.Span(value).Bold();
+        });
+    });
+}
+
+static void RenderImportantBox(ColumnDescriptor column, List<Paragraph> paragraphs)
+{
+    column.Item()
+        .PaddingVertical(16)
+        .Border(1)
+        .BorderColor(Colors.Grey.Darken2)
+        .Padding(20)
+        .Column(boxColumn =>
+        {
+            foreach (var p in paragraphs)
+            {
+                var text = p.Text?.Trim() ?? string.Empty;
+                if (string.IsNullOrEmpty(text)) continue;
+
+                // Title "IMPORTANT"
+                if (text.Equals("IMPORTANT", StringComparison.OrdinalIgnoreCase))
+                {
+                    boxColumn.Item().PaddingBottom(12).AlignCenter().Text(t =>
+                    {
+                        t.Span("IMPORTANT").Bold().FontSize(14);
+                    });
+                }
+                // Company name
+                else if (text.Contains("ZENITH GENERAL INSURANCE", StringComparison.OrdinalIgnoreCase))
+                {
+                    boxColumn.Item().PaddingTop(8).AlignCenter().Text(t =>
+                    {
+                        t.Span(text).Bold().FontSize(11);
+                    });
+                }
+                // Contact details (smaller, centered)
+                else if (text.StartsWith("OFFICE:", StringComparison.OrdinalIgnoreCase) ||
+                         text.StartsWith("Tel:", StringComparison.OrdinalIgnoreCase))
+                {
+                    boxColumn.Item().AlignCenter().Text(t =>
+                    {
+                        t.Span(text).FontSize(9);
+                    });
+                }
+                // Regular text in box
+                else
+                {
+                    boxColumn.Item().PaddingBottom(4).AlignCenter().Text(t =>
+                    {
+                        ProcessTextRunsForBox(t, p);
+                    });
+                }
+            }
+        });
+}
+
+static void ProcessTextRunsForBox(TextDescriptor text, Paragraph paragraph)
+{
+    foreach (var run in paragraph.MagicText)
+    {
+        if (string.IsNullOrEmpty(run.text)) continue;
+
+        var span = text.Span(run.text);
+
+        if (run.formatting?.Bold == true) span.Bold();
+        if (run.formatting?.Italic == true) span.Italic();
+        if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) span.Underline();
+
+        if (run.formatting?.Size.HasValue == true)
+        {
+            span.FontSize((float)run.formatting.Size.Value);
+        }
+    }
+}
+
+static void ApplyAlignment(TextDescriptor text, Alignment? alignment)
+{
+    switch (alignment)
+    {
+        case Alignment.left:
+            text.AlignLeft();
+            break;
+        case Alignment.center:
+            text.AlignCenter();
+            break;
+        case Alignment.right:
+            text.AlignRight();
+            break;
+        case Alignment.both:
+            text.Justify();
+            break;
+        default:
+            text.AlignLeft();
+            break;
+    }
+}
+
+static void ProcessTextRuns(TextDescriptor text, Paragraph paragraph)
+{
+    foreach (var run in paragraph.MagicText)
+    {
+        if (string.IsNullOrEmpty(run.text)) continue;
+
+        var textParts = run.text.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
+
+        for (int i = 0; i < textParts.Length; i++)
+        {
+            if (i > 0) text.Span("\n");
+
+            var part = textParts[i];
+            if (string.IsNullOrEmpty(part)) continue;
+
+            var hyperlink = paragraph.Hyperlinks?.FirstOrDefault(h =>
+                !string.IsNullOrEmpty(h.Text) && h.Text.Contains(part));
+
+            if (hyperlink != null && hyperlink.Uri != null)
+            {
+                try
+                {
+                    var uriString = hyperlink.Uri.ToString();
+                    if (!string.IsNullOrEmpty(uriString))
+                    {
+                        var linkSpan = text.Hyperlink(part, uriString);
+                        linkSpan.FontColor(Colors.Blue.Darken1);
+                        linkSpan.Underline();
+                        if (run.formatting?.Bold == true) linkSpan.Bold();
+                        if (run.formatting?.Italic == true) linkSpan.Italic();
+                        continue;
+                    }
+                }
+                catch { }
+            }
+
+            var span = text.Span(part);
+
+            if (run.formatting?.Bold == true) span.Bold();
+            if (run.formatting?.Italic == true) span.Italic();
+            if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) span.Underline();
+
+            if (run.formatting?.FontFamily != null)
+            {
+                span.FontFamily(run.formatting.FontFamily.ToString());
+            }
+
+            if (run.formatting?.FontColor.HasValue == true)
+            {
+                var color = run.formatting.FontColor.Value;
+                span.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
+            }
+
+            if (run.formatting?.Size.HasValue == true)
+            {
+                span.FontSize((float)run.formatting.Size.Value);
+            }
+        }
+    }
 }
