@@ -91,10 +91,10 @@ public class WordToPdfService
 
             // Generate filename with policy number and timestamp
             var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            var sanitizedPolicyNumber = string.IsNullOrEmpty(result.PolicyNumber) 
-                ? "NOPOLICY" 
+            var sanitizedPolicyNumber = string.IsNullOrEmpty(result.PolicyNumber)
+                ? "NOPOLICY"
                 : string.Join("_", result.PolicyNumber.Split(Path.GetInvalidFileNameChars()));
-            
+
             var generatedFileName = $"{originalFileName}_{sanitizedPolicyNumber}_{timestamp}.pdf";
             var outputPath = Path.Combine(outputDirectory, generatedFileName);
 

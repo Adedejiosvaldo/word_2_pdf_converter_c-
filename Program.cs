@@ -37,6 +37,13 @@ app.UseCors();
 app.UseAuthorization();
 app.MapControllers();
 
+// Configure port for cloud hosting
+var port = Environment.GetEnvironmentVariable("PORT");
+if (!string.IsNullOrEmpty(port))
+{
+    app.Urls.Add($"http://0.0.0.0:{port}");
+}
+
 // Print startup info
 var urls = app.Urls.Any() ? string.Join(", ", app.Urls) : "http://localhost:5000";
 Console.WriteLine("======================================");
