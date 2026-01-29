@@ -23,13 +23,13 @@ public class ConvertController : ControllerBase
     /// Convert a Word document to PDF
     /// </summary>
     /// <param name="file">The Word document file (.docx)</param>
-    /// <param name="outputPath">The destination path where the PDF should be saved</param>
+    /// <param name="outputPath">Optional: The destination path where the PDF should be saved. If not provided, uses the same path as input with .pdf extension</param>
     /// <returns>Conversion result with the PDF path</returns>
     [HttpPost]
     [RequestSizeLimit(50_000_000)] // 50MB limit
     public async Task<IActionResult> Convert(
         [FromForm] IFormFile file,
-        [FromForm] string outputPath)
+        [FromForm] string? outputPath = null)
     {
         // Validate file
         if (file == null || file.Length == 0)
@@ -52,14 +52,25 @@ public class ConvertController : ControllerBase
             });
         }
 
-        // Validate output path
+        // Auto-generate output path from input file if not provided
         if (string.IsNullOrWhiteSpace(outputPath))
         {
-            return BadRequest(new ConversionResult
+            // Get filename without extension
+            var inputFileName = Path.GetFileNameWithoutExtension(file.FileName);
+            
+            // Use current working directory as base
+            var baseDirectory = Directory.GetCurrentDirectory();
+            
+            // Generate output path: same directory as the application, same name, .pdf extension
+            outputPath = Path.Combine(baseDirectory, $"{inputFileName}.pdf");
+        }
+        else
+        {
+            // Ensure .pdf extension if path was provided
+            if (!outputPath.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
             {
-                Success = false,
-                Message = "Output path is required"
-            });
+                outputPath += ".pdf";
+            }
         }
 
         _logger.LogInformation("Converting {FileName} to PDF at {OutputPath}", file.FileName, outputPath);
