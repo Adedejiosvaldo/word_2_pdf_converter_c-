@@ -23,7 +23,7 @@ public class ConvertController : ControllerBase
     /// Convert a Word document to PDF
     /// </summary>
     /// <param name="file">The Word document file (.docx)</param>
-    /// <param name="outputPath">Optional: The destination path where the PDF should be saved. If not provided, uses the same path as input with .pdf extension</param>
+    /// <param name="outputPath">The destination directory where the PDF should be saved. If not provided, uses current directory. Filename is auto-generated as: {original}_{policy}_{timestamp}.pdf</param>
     /// <returns>Conversion result with the PDF path</returns>
     [HttpPost]
     [RequestSizeLimit(50_000_000)] // 50MB limit
@@ -52,34 +52,45 @@ public class ConvertController : ControllerBase
             });
         }
 
-        // Auto-generate output path from input file if not provided
+        // Validate and prepare output directory
         if (string.IsNullOrWhiteSpace(outputPath))
         {
-            // Get filename without extension
-            var inputFileName = Path.GetFileNameWithoutExtension(file.FileName);
-            
-            // Use current working directory as base
-            var baseDirectory = Directory.GetCurrentDirectory();
-            
-            // Generate output path: same directory as the application, same name, .pdf extension
-            outputPath = Path.Combine(baseDirectory, $"{inputFileName}.pdf");
+            outputPath = Directory.GetCurrentDirectory();
         }
-        else
+
+        // If outputPath ends with .pdf, treat it as a directory path (remove .pdf)
+        if (outputPath.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
         {
-            // Ensure .pdf extension if path was provided
-            if (!outputPath.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
+            outputPath = Path.GetDirectoryName(outputPath) ?? outputPath;
+        }
+
+        // Ensure directory exists
+        if (!Directory.Exists(outputPath))
+        {
+            try
             {
-                outputPath += ".pdf";
+                Directory.CreateDirectory(outputPath);
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(new ConversionResult
+                {
+                    Success = false,
+                    Message = $"Cannot create output directory: {ex.Message}"
+                });
             }
         }
 
-        _logger.LogInformation("Converting {FileName} to PDF at {OutputPath}", file.FileName, outputPath);
+        // Get original filename without extension
+        var originalFileName = Path.GetFileNameWithoutExtension(file.FileName);
+
+        _logger.LogInformation("Converting {FileName} to PDF in directory {OutputDirectory}", file.FileName, outputPath);
 
         try
         {
-            // Convert the file
+            // Convert the file - document loaded ONCE inside the service
             using var stream = file.OpenReadStream();
-            var result = _conversionService.ConvertToPdf(stream, outputPath);
+            var result = _conversionService.ConvertToPdf(stream, outputPath, originalFileName);
 
             if (result.Success)
             {

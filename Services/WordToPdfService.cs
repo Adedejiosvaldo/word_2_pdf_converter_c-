@@ -66,31 +66,37 @@ public class WordToPdfService
     }
 
     /// <summary>
-    /// Convert a Word document stream to PDF and save to the specified path
+    /// Convert a Word document stream to PDF and save to the specified directory
     /// </summary>
-    public ConversionResult ConvertToPdf(Stream docxStream, string outputPath)
+    /// <param name="docxStream">The Word document stream</param>
+    /// <param name="outputDirectory">The directory where the PDF should be saved</param>
+    /// <param name="originalFileName">The original filename (without extension) for generating output filename</param>
+    public ConversionResult ConvertToPdf(Stream docxStream, string outputDirectory, string originalFileName)
     {
         var result = new ConversionResult();
 
         try
         {
             // Ensure the output directory exists
-            var directory = Path.GetDirectoryName(outputPath);
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+            if (!Directory.Exists(outputDirectory))
             {
-                Directory.CreateDirectory(directory);
+                Directory.CreateDirectory(outputDirectory);
             }
 
-            // Ensure .pdf extension
-            if (!outputPath.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
-            {
-                outputPath += ".pdf";
-            }
-
+            // Load document ONCE
             using var wordDocument = DocX.Load(docxStream);
 
-            // Extract dynamic values
+            // Extract dynamic values (metadata) from the document
             ExtractDocumentMetadata(wordDocument, result);
+
+            // Generate filename with policy number and timestamp
+            var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            var sanitizedPolicyNumber = string.IsNullOrEmpty(result.PolicyNumber) 
+                ? "NOPOLICY" 
+                : string.Join("_", result.PolicyNumber.Split(Path.GetInvalidFileNameChars()));
+            
+            var generatedFileName = $"{originalFileName}_{sanitizedPolicyNumber}_{timestamp}.pdf";
+            var outputPath = Path.Combine(outputDirectory, generatedFileName);
 
             // Track tables
             var allTables = wordDocument.Tables.ToList();
