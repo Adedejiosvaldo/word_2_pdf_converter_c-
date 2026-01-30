@@ -1,4 +1,4 @@
-using WordToPdf.Services;
+﻿using WordToPdf.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -27,11 +27,9 @@ builder.Services.AddCors(options =>
 var app = builder.Build();
 
 // Configure the HTTP request pipeline
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
+// Enable Swagger in all environments for easier testing
+app.UseSwagger();
+app.UseSwaggerUI();
 
 app.UseCors();
 app.UseAuthorization();

@@ -73,114 +73,88 @@ public class WordToPdfService
     /// <param name="docxStream">The Word document stream</param>
     /// <param name="outputDirectory">The directory where the PDF should be saved</param>
     /// <param name="originalFileName">The original filename (without extension) for generating output filename</param>
+    /// <summary>
+    /// Convert a Word document stream to PDF and save to the specified directory
+    /// </summary>
+    /// <param name="docxStream">The Word document stream</param>
+    /// <param name="outputDirectory">The directory where the PDF should be saved</param>
+    /// <param name="originalFileName">The original filename (without extension) for generating output filename</param>
     public ConversionResult ConvertToPdf(Stream docxStream, string outputDirectory, string originalFileName)
     {
         var result = new ConversionResult();
-
         try
         {
-            // Ensure the output directory exists
             if (!Directory.Exists(outputDirectory))
             {
                 Directory.CreateDirectory(outputDirectory);
             }
 
-            using var ms = new MemoryStream();
-            docxStream.CopyTo(ms);
-            ms.Position = 0;
+            // Generate the PDF document object
+            var (pdfDocument, metadata, docxMs) = GenerateDocumentModel(docxStream);
 
-            // Sanitize the document to remove unsupported elements like altChunks
-            Console.WriteLine("Starting document sanitization...");
-            try
+            // We need docxMs to stay open during generation if it's used?
+            // Actually GenerateDocumentModel consumes docxStream and returns a new MemoryStream if needed,
+            // but QuestPDF generation happens here.
+
+            // Let's refine: GenerateDocumentModel should handle the DocX loading and QuestPDF definition.
+            // But QuestPDF generation needs the DocX object references.
+
+            // To properly refactor without breaking scoping:
+            // I'll implement a full "ConvertToPdfStream" separately reusing a private "PrepareDocument" method.
+
+            using (docxMs) // Ensure disposal of the memory stream created in helper
             {
-                SanitizeDocument(ms);
-                ms.Position = 0;
-                Console.WriteLine("Document sanitization completed.");
+                result.InsuredName = metadata.InsuredName;
+                result.PolicyNumber = metadata.PolicyNumber;
+
+                // Generate filename
+                var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                var sanitizedPolicyNumber = string.IsNullOrEmpty(result.PolicyNumber)
+                    ? "NOPOLICY"
+                    : string.Join("_", result.PolicyNumber.Split(Path.GetInvalidFileNameChars()));
+
+                var generatedFileName = $"{originalFileName}_{sanitizedPolicyNumber}_{timestamp}.pdf";
+                var outputPath = Path.Combine(outputDirectory, generatedFileName);
+
+                pdfDocument.GeneratePdf(outputPath);
+
+                result.Success = true;
+                result.PdfPath = Path.GetFullPath(outputPath);
+                result.Message = "PDF created successfully";
             }
-            catch (Exception ex)
-            {
-                // Log warning but attempt to proceed if sanitization fails
-                 Console.WriteLine($"Sanitization FAILED: {ex.Message}");
-                 Console.WriteLine(ex.StackTrace);
-                 ms.Position = 0;
-            }
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Message = $"Conversion failed: {ex.Message}";
+            result.Error = ex.ToString();
+        }
+        return result;
+    }
 
-            // Load document ONCE
-            using var wordDocument = DocX.Load(ms);
+    /// <summary>
+    /// Convert a Word document stream to PDF and return the PDF file stream
+    /// </summary>
+    public (ConversionResult Result, MemoryStream PdfStream) ConvertToPdfStream(Stream docxStream, string originalFileName)
+    {
+        var result = new ConversionResult();
+        MemoryStream pdfStream = new MemoryStream();
 
-            // Extract dynamic values (metadata) from the document
-            ExtractDocumentMetadata(wordDocument, result);
+        try
+        {
+             var (pdfDocument, metadata, docxMs) = GenerateDocumentModel(docxStream);
+             using (docxMs)
+             {
+                 result.InsuredName = metadata.InsuredName;
+                 result.PolicyNumber = metadata.PolicyNumber;
 
-            // Generate filename with policy number and timestamp
-            var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            var sanitizedPolicyNumber = string.IsNullOrEmpty(result.PolicyNumber)
-                ? "NOPOLICY"
-                : string.Join("_", result.PolicyNumber.Split(Path.GetInvalidFileNameChars()));
+                 pdfDocument.GeneratePdf(pdfStream);
+                 pdfStream.Position = 0;
 
-            var generatedFileName = $"{originalFileName}_{sanitizedPolicyNumber}_{timestamp}.pdf";
-            var outputPath = Path.Combine(outputDirectory, generatedFileName);
-
-            // Track tables
-            var allTables = wordDocument.Tables.ToList();
-            var paragraphsInTables = new HashSet<Paragraph>();
-            foreach (var table in allTables)
-            {
-                foreach (var p in table.Paragraphs)
-                {
-                    paragraphsInTables.Add(p);
-                }
-            }
-
-            // Create PDF
-            QuestPDF.Fluent.Document.Create(container =>
-            {
-                container.Page(page =>
-                {
-                    page.Size(PageSizes.A4);
-                    page.Margin(2, Unit.Centimetre);
-                    page.PageColor(Colors.White);
-                    page.DefaultTextStyle(x => x.FontSize(11).FontFamily("Arial"));
-
-                    // Header: Policy number (page 2+ only)
-                    page.Header()
-                        .ShowIf(ctx => ctx.PageNumber > 1)
-                        .AlignRight()
-                        .Text($"POLICY NO: {result.PolicyNumber}")
-                        .FontSize(9);
-
-                    // Footer
-                    page.Footer()
-                        .ShowIf(ctx => ctx.PageNumber > 0)
-                        .Column(footerColumn =>
-                        {
-                            footerColumn.Item().PaddingBottom(4).LineHorizontal(0.5f).LineColor(Colors.Black);
-
-                            footerColumn.Item().Row(row =>
-                            {
-                                row.RelativeItem().AlignLeft().Text("ZENITH GENERAL INSURANCE CO. LTD").FontSize(8);
-                                row.RelativeItem().AlignCenter().Text(text =>
-                                {
-                                    text.CurrentPageNumber().FontSize(8);
-                                });
-                                row.RelativeItem().AlignRight().Text(result.InsuredName).FontSize(8);
-                            });
-
-                            footerColumn.Item().PaddingTop(4).AlignCenter()
-                                .Text("Authorised and regulated by the National Insurance Commission [RIC-048]")
-                                .FontSize(7);
-                        });
-
-                    // Content
-                    page.Content().Column(column =>
-                    {
-                        RenderContent(column, wordDocument, paragraphsInTables, allTables);
-                    });
-                });
-            }).GeneratePdf(outputPath);
-
-            result.Success = true;
-            result.PdfPath = Path.GetFullPath(outputPath);
-            result.Message = "PDF created successfully";
+                 result.Success = true;
+                 result.Message = "PDF generated in memory";
+                 result.PdfPath = "MEMORY_STREAM";
+             }
         }
         catch (Exception ex)
         {
@@ -189,7 +163,95 @@ public class WordToPdfService
             result.Error = ex.ToString();
         }
 
-        return result;
+        return (result, pdfStream);
+    }
+
+    private (QuestPDF.Infrastructure.IDocument pdfDocument, ConversionResult metadata, MemoryStream docxMs) GenerateDocumentModel(Stream inputDocxStream)
+    {
+        var ms = new MemoryStream();
+        inputDocxStream.CopyTo(ms);
+        ms.Position = 0;
+
+        // Sanitize
+        Console.WriteLine("Starting document sanitization...");
+        try
+        {
+            SanitizeDocument(ms);
+            ms.Position = 0;
+            Console.WriteLine("Document sanitization completed.");
+        }
+        catch (Exception ex)
+        {
+             Console.WriteLine($"Sanitization FAILED: {ex.Message}");
+             ms.Position = 0;
+        }
+
+        // Load DocX
+        var wordDocument = DocX.Load(ms);
+
+        // Metadata
+        var metadata = new ConversionResult();
+        ExtractDocumentMetadata(wordDocument, metadata);
+
+        // Track tables
+        var allTables = wordDocument.Tables.ToList();
+        var paragraphsInTables = new HashSet<Paragraph>();
+        foreach (var table in allTables)
+        {
+            foreach (var p in table.Paragraphs)
+            {
+                paragraphsInTables.Add(p);
+            }
+        }
+
+        // Create QuestPDF Document
+        var pdf = QuestPDF.Fluent.Document.Create(container =>
+        {
+            container.Page(page =>
+            {
+                page.Size(PageSizes.A4);
+                page.Margin(2, Unit.Centimetre);
+                page.PageColor(Colors.White);
+                page.DefaultTextStyle(x => x.FontSize(11).FontFamily("Arial"));
+
+                // Header
+                page.Header()
+                    .ShowIf(ctx => ctx.PageNumber > 1)
+                    .AlignRight()
+                    .Text($"POLICY NO: {metadata.PolicyNumber}")
+                    .FontSize(9);
+
+                // Footer
+                page.Footer()
+                    .ShowIf(ctx => ctx.PageNumber > 0)
+                    .Column(footerColumn =>
+                    {
+                        footerColumn.Item().PaddingBottom(4).LineHorizontal(0.5f).LineColor(Colors.Black);
+
+                        footerColumn.Item().Row(row =>
+                        {
+                            row.RelativeItem().AlignLeft().Text("ZENITH GENERAL INSURANCE CO. LTD").FontSize(8);
+                            row.RelativeItem().AlignCenter().Text(text =>
+                            {
+                                text.CurrentPageNumber().FontSize(8);
+                            });
+                            row.RelativeItem().AlignRight().Text(metadata.InsuredName).FontSize(8);
+                        });
+
+                        footerColumn.Item().PaddingTop(4).AlignCenter()
+                            .Text("Authorised and regulated by the National Insurance Commission [RIC-048]")
+                            .FontSize(7);
+                    });
+
+                // Content
+                page.Content().Column(column =>
+                {
+                    RenderContent(column, wordDocument, paragraphsInTables, allTables);
+                });
+            });
+        });
+
+        return (pdf, metadata, ms);
     }
 
     private void ExtractDocumentMetadata(DocX wordDocument, ConversionResult result)
@@ -411,37 +473,55 @@ public class WordToPdfService
             }
 
             // Images
-            if (paragraph.Pictures != null && paragraph.Pictures.Count > 0)
+            IList<Picture> pictures = null;
+            bool manualExtractionNeeded = false;
+            try
             {
-                foreach (var picture in paragraph.Pictures)
+               // This property getter can throw OverflowException for corrupt images
+               pictures = paragraph.Pictures;
+            }
+            catch
+            {
+                manualExtractionNeeded = true;
+            }
+
+            // Normal processing
+            if (!manualExtractionNeeded && pictures != null && pictures.Count > 0)
+            {
+                foreach (var picture in pictures)
                 {
                     try
                     {
                         var imageId = picture.Id;
-                        var imagePart = wordDocument.Images.FirstOrDefault(img => img.Id == imageId);
-
-                        if (imagePart != null)
-                        {
-                            using var stream = imagePart.GetStream(FileMode.Open, FileAccess.Read);
-                            using var memoryStream = new MemoryStream();
-                            stream.CopyTo(memoryStream);
-                            var imageBytes = memoryStream.ToArray();
-
-                            if (imageBytes.Length > 0)
-                            {
-                                column.Item()
-                                    .PaddingVertical(8)
-                                    .AlignCenter()
-                                    .MaxWidth(150)
-                                    .Image(imageBytes);
-                            }
-                        }
+                        ProcessImage(column, wordDocument, imageId, null, null);
                     }
                     catch { /* Skip failed images */ }
                 }
 
                 if (string.IsNullOrWhiteSpace(paragraphText))
                     continue;
+            }
+            // Fallback: Manual Extraction from XML
+            else if (manualExtractionNeeded)
+            {
+                 try
+                 {
+                     var manualImages = ManuallyExtractImages(paragraph);
+                     if (manualImages.Count > 0)
+                     {
+                         foreach (var img in manualImages)
+                         {
+                             ProcessImage(column, wordDocument, img.Id, img.Width, img.Height);
+                         }
+
+                         if (string.IsNullOrWhiteSpace(paragraphText))
+                            continue;
+                     }
+                 }
+                 catch (Exception ex)
+                 {
+                     Console.WriteLine($"Manual image extraction failed: {ex.Message}");
+                 }
             }
 
             // Empty paragraphs
@@ -828,6 +908,86 @@ public class WordToPdfService
             row.ConstantItem(140).Text(t => t.Span(label).Bold());
             row.RelativeItem().Text(t => t.Span(value).Bold());
         });
+    }
+
+    private struct ManualImageInfo
+    {
+        public string Id;
+        public float? Width; // in points
+        public float? Height; // in points
+    }
+
+    private List<ManualImageInfo> ManuallyExtractImages(Paragraph paragraph)
+    {
+        var results = new List<ManualImageInfo>();
+        var xml = paragraph.Xml; // Get raw XML XElement if exposed, or we might need to rely on other properties.
+        // Xceed Paragraph doesn't expose public XElement usually, but if it does:
+        // Checking documentation: DocX elements usually have an Xml property (XElement).
+
+        if (xml == null) return results;
+
+        XNamespace a = "http://schemas.openxmlformats.org/drawingml/2006/main";
+        XNamespace r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        XNamespace wp = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+
+        // Find blips
+        var blips = xml.Descendants(a + "blip");
+        foreach (var blip in blips)
+        {
+            var embed = blip.Attribute(r + "embed")?.Value;
+            if (!string.IsNullOrEmpty(embed))
+            {
+                float? width = null;
+                float? height = null;
+
+                // Try to find dimensions in parent 'xfrm' -> 'ext'
+                // hierarchy: drawing -> inline -> graphic -> graphicData -> pic -> spPr -> xfrm -> ext
+                var xfrm = blip.Ancestors(a + "graphic").FirstOrDefault()?.Descendants(a + "xfrm").FirstOrDefault();
+                if (xfrm != null)
+                {
+                    var ext = xfrm.Element(a + "ext");
+                    if (ext != null)
+                    {
+                         var cx = ext.Attribute("cx")?.Value;
+                         var cy = ext.Attribute("cy")?.Value;
+
+                         // EMU to Points: 1 pt = 12700 EMUs
+                         if (long.TryParse(cx, out long cxVal)) width = cxVal / 12700f;
+                         if (long.TryParse(cy, out long cyVal)) height = cyVal / 12700f;
+                    }
+                }
+
+                results.Add(new ManualImageInfo { Id = embed, Width = width, Height = height });
+            }
+        }
+
+        return results;
+    }
+
+    private void ProcessImage(ColumnDescriptor column, DocX wordDocument, string imageId, float? width, float? height)
+    {
+         var imagePart = wordDocument.Images.FirstOrDefault(img => img.Id == imageId);
+         if (imagePart != null)
+         {
+             using var stream = imagePart.GetStream(FileMode.Open, FileAccess.Read);
+             using var memoryStream = new MemoryStream();
+             stream.CopyTo(memoryStream);
+             var imageBytes = memoryStream.ToArray();
+
+             if (imageBytes.Length > 0)
+             {
+                 var imgContainer = column.Item()
+                     .PaddingVertical(8)
+                     .AlignCenter();
+
+                 // Apply dimensions if manually extracted
+                 if (width.HasValue && width.Value > 0) imgContainer = imgContainer.Width(width.Value);
+                 // if (height.HasValue && height.Value > 0) imgContainer = imgContainer.Height(height.Value); // QuestPDF usually handles aspect ratio if only width is set, or max width.
+                 else imgContainer = imgContainer.MaxWidth(150);
+
+                 imgContainer.Image(imageBytes);
+             }
+         }
     }
 
     private static void RenderImportantBox(ColumnDescriptor column, List<Paragraph> paragraphs)

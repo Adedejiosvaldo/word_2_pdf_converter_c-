@@ -116,6 +116,77 @@ public class ConvertController : ControllerBase
     }
 
     /// <summary>
+    /// Convert a Word document to PDF and download it directly
+    /// </summary>
+    /// <param name="file">The Word document file (.docx)</param>
+    /// <returns>The PDF file download</returns>
+    [HttpPost("Download")]
+    [RequestSizeLimit(50_000_000)] // 50MB limit
+    public async Task<IActionResult> Download([FromForm] IFormFile file)
+    {
+        // Validate file
+        if (file == null || file.Length == 0)
+        {
+            return BadRequest(new ConversionResult
+            {
+                Success = false,
+                Message = "No file uploaded"
+            });
+        }
+
+        // Validate file extension
+        var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+        if (extension != ".docx" && extension != ".doc")
+        {
+            return BadRequest(new ConversionResult
+            {
+                Success = false,
+                Message = "Invalid file type. Only .docx and .doc files are supported"
+            });
+        }
+
+        // Get original filename without extension
+        var originalFileName = Path.GetFileNameWithoutExtension(file.FileName);
+
+        _logger.LogInformation("Converting {FileName} to PDF for download", file.FileName);
+
+        try
+        {
+            using var stream = file.OpenReadStream();
+            // Call the stream-based conversion
+            var (result, pdfStream) = _conversionService.ConvertToPdfStream(stream, originalFileName);
+
+            if (result.Success && pdfStream != null)
+            {
+                _logger.LogInformation("Successfully converted to stream");
+
+                // Construct a filename for download
+                var downloadName = $"{originalFileName}_{result.PolicyNumber ?? "converted"}.pdf";
+
+                // Return file stream (FileContentResult would require reading all bytes, FileStreamResult is better for memory)
+                // Note: The stream must be open. But 'pdfStream' is a MemoryStream created in service.
+                // We need to ensure it's not disposed prematurely. The service returns it, transferring ownership to controller.
+                return File(pdfStream, "application/pdf", downloadName);
+            }
+            else
+            {
+                _logger.LogWarning("Conversion failed: {Message}", result.Message);
+                return BadRequest(result);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error converting document");
+            return StatusCode(500, new ConversionResult
+            {
+                Success = false,
+                Message = "Internal server error during conversion",
+                Error = ex.Message
+            });
+        }
+    }
+
+    /// <summary>
     /// Health check endpoint
     /// </summary>
     [HttpGet("health")]
