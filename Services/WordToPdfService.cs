@@ -67,6 +67,18 @@ public class WordToPdfService
         "FIRE INSURANCE"
     };
 
+    // ISSUE 2: Track if we've rendered the first insurance type heading
+    private bool _hasRenderedFirstInsuranceType = false;
+
+    // ISSUE 5: Track if content has been rendered since last page break
+    private bool _hasContentSincePageBreak = true;
+
+    // ISSUE 6: Track image count for signature sizing
+    private int _imageCount = 0;
+
+    // ISSUE 7: Track if we're in policy conditions section for spacing
+    private bool _inPolicyConditions = false;
+
     public WordToPdfService()
     {
         QuestPDF.Settings.License = LicenseType.Community;
@@ -512,6 +524,13 @@ public class WordToPdfService
     private void RenderContent(ColumnDescriptor column, DocX wordDocument, HashSet<Paragraph> paragraphsInTables, List<Table> allTables)
     {
         _numCounters.Clear();
+
+        // Reset tracking fields for this document
+        _hasRenderedFirstInsuranceType = false;
+        _hasContentSincePageBreak = true;
+        _imageCount = 0;
+        _inPolicyConditions = false;
+
         bool insideImportantSection = false;
         List<Paragraph> importantParagraphs = new();
 
@@ -626,7 +645,12 @@ public class WordToPdfService
                     importantParagraphs.Clear();
                     insideImportantSection = false;
                 }
-                column.Item().PageBreak();
+                // ISSUE 5 FIX: Only add page break if content was rendered since last break
+                if (_hasContentSincePageBreak)
+                {
+                    column.Item().PageBreak();
+                    _hasContentSincePageBreak = false;
+                }
                 break;
             }
         }
@@ -641,7 +665,12 @@ public class WordToPdfService
                 insideImportantSection = false;
             }
 
-            column.Item().PageBreak();
+            // ISSUE 5 FIX: Only add page break if content was rendered since last break
+            if (_hasContentSincePageBreak)
+            {
+                column.Item().PageBreak();
+                _hasContentSincePageBreak = false;
+            }
             if (string.IsNullOrWhiteSpace(paragraph.Text?.Replace("\f", "").Replace("\x0C", "")))
                 return;
         }
@@ -800,6 +829,13 @@ public class WordToPdfService
             }
             else if (IsInsuranceTypeHeading(paragraphText))
             {
+                // ISSUE 2 FIX: Page break before second insurance type heading
+                if (_hasRenderedFirstInsuranceType)
+                {
+                    column.Item().PageBreak();
+                }
+                _hasRenderedFirstInsuranceType = true;
+
                 fontSize = 16;
                 paddingTop = 20;
                 paddingBottom = 16;
@@ -812,11 +848,20 @@ public class WordToPdfService
                 paddingBottom = 8;
             }
 
+            // ISSUE 7: Track if entering policy conditions section
+            if (paragraphText.StartsWith("POLICY CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
+                paragraphText.StartsWith("CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
+                paragraphText.StartsWith("EXCEPTIONS", StringComparison.OrdinalIgnoreCase))
+            {
+                _inPolicyConditions = true;
+            }
+
             column.Item().PaddingTop(paddingTop).PaddingBottom(paddingBottom).Text(text =>
             {
                 text.Span(paragraphText).Bold().FontSize(fontSize);
                 ApplyAlignment(text, alignment);
             });
+            _hasContentSincePageBreak = true;
             return;
         }
 
@@ -1099,12 +1144,32 @@ public class WordToPdfService
     {
         var style = new RunStyle();
 
+        // Method 1: Try direct properties
         try { style.FontName = run.FontFamily?.Name; } catch { }
         try { style.FontSize = (float?)run.FontSize; } catch { }
-        try { style.Bold = run.Bold; } catch { }
-        try { style.Italic = run.Italic; } catch { }
+        try { style.Bold = run.Bold == true; } catch { }
+        try { style.Italic = run.Italic == true; } catch { }
         try { style.Underline = run.UnderlineStyle != UnderlineStyle.none; } catch { }
 
+        // Method 2: Check run.formatting property (used by MagicText)
+        try
+        {
+            var formatting = run.formatting;
+            if (formatting != null)
+            {
+                if (formatting.Bold == true) style.Bold = true;
+                if (formatting.Italic == true) style.Italic = true;
+                if (formatting.UnderlineStyle != null && formatting.UnderlineStyle != UnderlineStyle.none)
+                    style.Underline = true;
+                if (formatting.FontFamily?.Name != null)
+                    style.FontName = formatting.FontFamily.Name;
+                if (formatting.FontSize != null)
+                    style.FontSize = (float?)formatting.FontSize;
+            }
+        }
+        catch { }
+
+        // Method 3: Parse XML directly for most reliable detection
         XElement? rPr = null;
         try { rPr = run.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "rPr"); } catch { }
 
@@ -1132,9 +1197,28 @@ public class WordToPdfService
                 style.Color = color.Attribute(w + "val")?.Value;
             }
 
-            if (rPr.Element(w + "b") != null) style.Bold = true;
-            if (rPr.Element(w + "i") != null) style.Italic = true;
-            if (rPr.Element(w + "u") != null) style.Underline = true;
+            // XML-based detection is most reliable - these override property checks
+            // <w:b/> means bold, <w:b w:val="0"/> means not bold
+            var boldElement = rPr.Element(w + "b");
+            if (boldElement != null)
+            {
+                var val = boldElement.Attribute(w + "val")?.Value;
+                style.Bold = val == null || val == "1" || val == "true";
+            }
+
+            var italicElement = rPr.Element(w + "i");
+            if (italicElement != null)
+            {
+                var val = italicElement.Attribute(w + "val")?.Value;
+                style.Italic = val == null || val == "1" || val == "true";
+            }
+
+            var underlineElement = rPr.Element(w + "u");
+            if (underlineElement != null)
+            {
+                var val = underlineElement.Attribute(w + "val")?.Value;
+                style.Underline = val != "none";
+            }
         }
 
         return style;
@@ -1489,6 +1573,7 @@ public class WordToPdfService
 
     /// <summary>
     /// FIXED: Improved table rendering with better handling of empty cells and borders
+    /// Also detects tables that should be borderless (INSURED/POLICY info, Prepared by)
     /// </summary>
     private void RenderTable(ColumnDescriptor parentColumn, Table table)
     {
@@ -1497,6 +1582,9 @@ public class WordToPdfService
         // Calculate total columns
         int totalGridColumns = table.Rows[0].Cells.Sum(c => ExtractCellStyle(c).GridSpan);
         if (totalGridColumns <= 0) return;
+
+        // ISSUE 1 FIX: Detect tables that should be borderless
+        bool isBorderlessTable = ShouldTableBeBorderless(table);
 
         parentColumn.Item().Table(tableElement =>
         {
@@ -1556,15 +1644,18 @@ public class WordToPdfService
 
                     QuestPDF.Infrastructure.IContainer container = cellElement;
 
-                    // Apply borders - FIXED: Only apply if border size > 0
-                    if (style.TopBorderSize > 0)
-                        container = container.BorderTop(style.TopBorderSize).BorderColor("#" + style.TopBorderColor);
-                    if (style.BottomBorderSize > 0)
-                        container = container.BorderBottom(style.BottomBorderSize).BorderColor("#" + style.BottomBorderColor);
-                    if (style.LeftBorderSize > 0)
-                        container = container.BorderLeft(style.LeftBorderSize).BorderColor("#" + style.LeftBorderColor);
-                    if (style.RightBorderSize > 0)
-                        container = container.BorderRight(style.RightBorderSize).BorderColor("#" + style.RightBorderColor);
+                    // Apply borders - FIXED: Skip borders for borderless tables
+                    if (!isBorderlessTable)
+                    {
+                        if (style.TopBorderSize > 0)
+                            container = container.BorderTop(style.TopBorderSize).BorderColor("#" + style.TopBorderColor);
+                        if (style.BottomBorderSize > 0)
+                            container = container.BorderBottom(style.BottomBorderSize).BorderColor("#" + style.BottomBorderColor);
+                        if (style.LeftBorderSize > 0)
+                            container = container.BorderLeft(style.LeftBorderSize).BorderColor("#" + style.LeftBorderColor);
+                        if (style.RightBorderSize > 0)
+                            container = container.BorderRight(style.RightBorderSize).BorderColor("#" + style.RightBorderColor);
+                    }
 
                     // FIXED: Better cell padding
                     container.Padding(6).Column(cellColumn =>
@@ -1617,6 +1708,29 @@ public class WordToPdfService
         });
     }
 
+    /// <summary>
+    /// ISSUE 1: Detect tables that should be borderless
+    /// - INSURED/POLICY info tables (contain INSURED:, POLICY NUMBER:, PERIOD OF, FROM:, TO:)
+    /// - Prepared by/Reviewed by footer tables
+    /// </summary>
+    private bool ShouldTableBeBorderless(Table table)
+    {
+        // Get all text content from the table
+        var tableText = string.Join(" ", table.Paragraphs.Select(p => p.Text?.Trim() ?? "")).ToUpperInvariant();
+
+        // Check for INSURED/POLICY info table patterns
+        bool isInsuredPolicyTable =
+            (tableText.Contains("INSURED:") || tableText.Contains("INSURED :")) &&
+            (tableText.Contains("POLICY") || tableText.Contains("PERIOD OF"));
+
+        // Check for Prepared by/Reviewed by table
+        bool isPreparedByTable =
+            tableText.Contains("PREPARED BY") ||
+            tableText.Contains("REVIEWED BY");
+
+        return isInsuredPolicyTable || isPreparedByTable;
+    }
+
     private void ProcessBorder(XElement? border, out float size, out string color)
     {
         size = 0;
@@ -1647,6 +1761,12 @@ public class WordToPdfService
         float paddingTop = style.SpacingBefore ?? 4;
         float paddingBottom = style.SpacingAfter ?? 4;
 
+        // ISSUE 7 FIX: Apply 1.5 line spacing for policy conditions section
+        if (_inPolicyConditions)
+        {
+            paddingBottom = Math.Max(paddingBottom, 12); // 1.5 line spacing
+        }
+
         var item = column.Item()
             .PaddingTop(paddingTop)
             .PaddingBottom(paddingBottom)
@@ -1658,10 +1778,14 @@ public class WordToPdfService
             ProcessTextRuns(text, paragraph);
             ApplyAlignment(text, style.Alignment);
         });
+
+        _hasContentSincePageBreak = true;
     }
 
     private void ProcessImage(ColumnDescriptor column, DocX wordDocument, string imageId, float? width, float? height)
     {
+         _imageCount++;
+
          var imagePart = wordDocument.Images.FirstOrDefault(img => img.Id == imageId);
          if (imagePart != null)
          {
@@ -1672,14 +1796,26 @@ public class WordToPdfService
 
              if (imageBytes.Length > 0)
              {
-                 var imgContainer = column.Item()
-                     .PaddingVertical(10)
-                     .AlignCenter();
+                 // ISSUE 6 FIX: Signature images (2nd image onwards) should be smaller
+                 bool isSignatureImage = _imageCount >= 2;
 
-                 if (width.HasValue && width.Value > 0)
-                     imgContainer = imgContainer.MaxWidth(Math.Min(width.Value, 400));
+                 var imgContainer = column.Item()
+                     .PaddingVertical(isSignatureImage ? 5 : 10);
+
+                 if (isSignatureImage)
+                 {
+                     // Signature image: smaller and right-aligned
+                     imgContainer = imgContainer.AlignRight();
+                     imgContainer = imgContainer.MaxWidth(80).MaxHeight(80);
+                 }
                  else
-                     imgContainer = imgContainer.MaxWidth(200);
+                 {
+                     imgContainer = imgContainer.AlignCenter();
+                     if (width.HasValue && width.Value > 0)
+                         imgContainer = imgContainer.MaxWidth(Math.Min(width.Value, 400));
+                     else
+                         imgContainer = imgContainer.MaxWidth(200);
+                 }
 
                  imgContainer.Image(imageBytes);
              }
