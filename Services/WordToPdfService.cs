@@ -188,6 +188,13 @@ public class WordToPdfService
              ms.Position = 0;
         }
 
+        // Load Numbering & Sections
+        ms.Position = 0;
+        LoadNumberingDefinitions(ms);
+        ms.Position = 0;
+        LoadSectionProperties(ms);
+        ms.Position = 0;
+
         // Load DocX
         var wordDocument = DocX.Load(ms);
 
@@ -217,33 +224,57 @@ public class WordToPdfService
                 page.DefaultTextStyle(x => x.FontSize(11).FontFamily("Arial"));
 
                 // Header
-                page.Header()
-                    .ShowIf(ctx => ctx.PageNumber > 1)
-                    .AlignRight()
-                    .Text($"POLICY NO: {metadata.PolicyNumber}")
-                    .FontSize(9);
+                page.Header().Column(headerCol =>
+                {
+                    // First Page Header
+                    headerCol.Item().ShowIf(ctx => ctx.PageNumber == 1 && _sectionProps.TitlePg && !string.IsNullOrEmpty(_sectionProps.FirstPageHeaderId))
+                        .Text(_headerFooterContent.GetValueOrDefault(_sectionProps.FirstPageHeaderId ?? "", ""))
+                        .FontSize(9).AlignRight();
+
+                    // Default Header (Page 2+)
+                    headerCol.Item().ShowIf(ctx => ctx.PageNumber > 1 || (!_sectionProps.TitlePg))
+                        .Row(row =>
+                        {
+                            row.RelativeItem().Text(text =>
+                            {
+                                if (_sectionProps.HeaderId != null && _headerFooterContent.TryGetValue(_sectionProps.HeaderId, out var hText))
+                                {
+                                    text.Span(hText).FontSize(9);
+                                }
+                            });
+                            row.RelativeItem().AlignRight().Text($"POLICY NO: {metadata.PolicyNumber}").FontSize(9);
+                        });
+                });
 
                 // Footer
-                page.Footer()
-                    .ShowIf(ctx => ctx.PageNumber > 0)
-                    .Column(footerColumn =>
-                    {
-                        footerColumn.Item().PaddingBottom(4).LineHorizontal(0.5f).LineColor(Colors.Black);
+                page.Footer().Column(footerColumn =>
+                {
+                    footerColumn.Item().PaddingBottom(4).LineHorizontal(0.5f).LineColor(Colors.Black);
 
-                        footerColumn.Item().Row(row =>
+                    // Dynamic Word Footer Content
+                    footerColumn.Item().Row(row =>
+                    {
+                        row.RelativeItem().AlignLeft().Column(c =>
                         {
-                            row.RelativeItem().AlignLeft().Text("ZENITH GENERAL INSURANCE CO. LTD").FontSize(8);
-                            row.RelativeItem().AlignCenter().Text(text =>
-                            {
-                                text.CurrentPageNumber().FontSize(8);
-                            });
-                            row.RelativeItem().AlignRight().Text(metadata.InsuredName).FontSize(8);
+                            c.Item().ShowIf(ctx => ctx.PageNumber == 1 && _sectionProps.TitlePg)
+                                .Text(_headerFooterContent.GetValueOrDefault(_sectionProps.FirstPageFooterId ?? "", "ZENITH GENERAL INSURANCE CO. LTD")).FontSize(8);
+
+                            c.Item().ShowIf(ctx => ctx.PageNumber > 1 || (!_sectionProps.TitlePg))
+                                .Text(_headerFooterContent.GetValueOrDefault(_sectionProps.FooterId ?? "", "ZENITH GENERAL INSURANCE CO. LTD")).FontSize(8);
                         });
 
-                        footerColumn.Item().PaddingTop(4).AlignCenter()
-                            .Text("Authorised and regulated by the National Insurance Commission [RIC-048]")
-                            .FontSize(7);
+                        row.RelativeItem().AlignCenter().Text(text =>
+                        {
+                            text.CurrentPageNumber().FontSize(8);
+                        });
+
+                        row.RelativeItem().AlignRight().Text(metadata.InsuredName).FontSize(8);
                     });
+
+                    footerColumn.Item().PaddingTop(4).AlignCenter()
+                        .Text("Authorised and regulated by the National Insurance Commission [RIC-048]")
+                        .FontSize(7);
+                });
 
                 // Content
                 page.Content().Column(column =>
@@ -430,9 +461,7 @@ public class WordToPdfService
 
     private void RenderContent(ColumnDescriptor column, DocX wordDocument, HashSet<Paragraph> paragraphsInTables, List<Table> allTables)
     {
-        int numberListCounter = 0;
-        ListItemType? currentListType = null;
-        int currentIndentLevel = -1;
+        _numCounters.Clear();
         bool insideImportantSection = false;
         List<Paragraph> importantParagraphs = new();
 
@@ -612,8 +641,6 @@ public class WordToPdfService
 
             if (isValidHeading)
             {
-                currentListType = null;
-                numberListCounter = 0;
 
                 var alignment = paragraph.Alignment;
                 float fontSize = 14;
@@ -669,52 +696,8 @@ public class WordToPdfService
             // List items
             if (paragraph.IsListItem)
             {
-                int indentLevel = paragraph.IndentLevel ?? 0;
-                float indent = indentLevel * 20f;
-
-                if (paragraph.ListItemType == ListItemType.Numbered)
-                {
-                    if (currentListType != ListItemType.Numbered || currentIndentLevel != indentLevel)
-                    {
-                        numberListCounter = 0;
-                    }
-                    currentListType = ListItemType.Numbered;
-                    currentIndentLevel = indentLevel;
-                    numberListCounter++;
-                }
-                else
-                {
-                    currentListType = ListItemType.Bulleted;
-                    currentIndentLevel = indentLevel;
-                }
-
-                string marker = paragraph.ListItemType == ListItemType.Numbered
-                    ? $"{numberListCounter})"
-                    : "•";
-
-                float listPaddingTop = GetParagraphSpacingBefore(paragraph);
-                float listPaddingBottom = GetParagraphSpacingAfter(paragraph);
-                if (listPaddingTop <= 0) listPaddingTop = 3;
-                if (listPaddingBottom <= 0) listPaddingBottom = 3;
-
-                column.Item().PaddingTop(listPaddingTop).PaddingBottom(listPaddingBottom).PaddingLeft(indent).Row(row =>
-                {
-                    row.ConstantItem(25).Text(marker).FontSize(11);
-                    row.RelativeItem().Text(text =>
-                    {
-                        ProcessTextRuns(text, paragraph);
-                        ApplyAlignment(text, paragraph.Alignment);
-                    });
-                });
+                RenderListItem(column, paragraph);
                 continue;
-            }
-
-            // Reset list counter
-            if (currentListType != null)
-            {
-                currentListType = null;
-                numberListCounter = 0;
-                currentIndentLevel = -1;
             }
 
             // Regular paragraphs
@@ -730,51 +713,7 @@ public class WordToPdfService
         // Tables
         foreach (var table in allTables)
         {
-            int columnCount = table.ColumnCount;
-            if (columnCount <= 0) continue;
-
-            column.Item().PaddingVertical(8).Table(tableElement =>
-            {
-                tableElement.ColumnsDefinition(columns =>
-                {
-                    for (int i = 0; i < columnCount; i++)
-                    {
-                        columns.RelativeColumn();
-                    }
-                });
-
-                foreach (var row in table.Rows)
-                {
-                    int cellIdx = 0;
-                    foreach (var cell in row.Cells)
-                    {
-                        if (cellIdx >= columnCount) break;
-
-                        var rowIndex = table.Rows.IndexOf(row);
-                        tableElement.Cell()
-                            .Row((uint)(rowIndex >= 0 ? rowIndex + 1 : 1))
-                            .Column((uint)(cellIdx + 1))
-                            .Border(0.5f)
-                            .BorderColor(Colors.Black)
-                            .Padding(5)
-                            .Column(cellColumn =>
-                            {
-                                foreach (var cellParagraph in cell.Paragraphs)
-                                {
-                                    var cellText = cellParagraph.Text?.Trim() ?? string.Empty;
-                                    if (string.IsNullOrEmpty(cellText)) continue;
-
-                                    cellColumn.Item().Text(text =>
-                                    {
-                                        ProcessTextRuns(text, cellParagraph);
-                                        ApplyAlignment(text, cellParagraph.Alignment);
-                                    });
-                                }
-                            });
-                        cellIdx++;
-                    }
-                }
-            });
+            RenderTable(column, table);
         }
     }
 
@@ -1008,16 +947,17 @@ public class WordToPdfService
 
     private RunStyle ExtractRunStyle(dynamic run)
     {
-        var style = new RunStyle
-        {
-            FontName = run.FontFamily?.Name,
-            FontSize = (float?)run.FontSize,
-            Bold = run.Bold,
-            Italic = run.Italic,
-            Underline = run.UnderlineStyle != UnderlineStyle.none
-        };
+        var style = new RunStyle();
 
-        var rPr = run.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "rPr");
+        try { style.FontName = run.FontFamily?.Name; } catch { }
+        try { style.FontSize = (float?)run.FontSize; } catch { }
+        try { style.Bold = run.Bold; } catch { }
+        try { style.Italic = run.Italic; } catch { }
+        try { style.Underline = run.UnderlineStyle != UnderlineStyle.none; } catch { }
+
+        XElement? rPr = null;
+        try { rPr = run.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "rPr"); } catch { }
+
         if (rPr != null)
         {
             XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -1052,6 +992,485 @@ public class WordToPdfService
         }
 
         return style;
+    }
+
+    private struct CellStyle
+    {
+        public int GridSpan;
+        public bool IsVerticalMergeRestart;
+        public bool IsVerticalMergeContinue;
+        public string TopBorderColor;
+        public float TopBorderSize;
+        public string BottomBorderColor;
+        public float BottomBorderSize;
+        public string LeftBorderColor;
+        public float LeftBorderSize;
+        public string RightBorderColor;
+        public float RightBorderSize;
+    }
+
+    private CellStyle ExtractCellStyle(Cell cell)
+    {
+        var style = new CellStyle
+        {
+            GridSpan = 1,
+            TopBorderSize = 0.5f,
+            BottomBorderSize = 0.5f,
+            LeftBorderSize = 0.5f,
+            RightBorderSize = 0.5f,
+            TopBorderColor = "000000",
+            BottomBorderColor = "000000",
+            LeftBorderColor = "000000",
+            RightBorderColor = "000000"
+        };
+
+        var tcPr = cell.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "tcPr");
+        if (tcPr != null)
+        {
+            XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+            // Grid Span (ColSpan)
+            var gridSpan = tcPr.Element(w + "gridSpan");
+            if (gridSpan != null && int.TryParse(gridSpan.Attribute(w + "val")?.Value, out int gs))
+            {
+                style.GridSpan = gs;
+            }
+
+            // Vertical Merge (RowSpan)
+            var vMerge = tcPr.Element(w + "vMerge");
+            if (vMerge != null)
+            {
+                var val = vMerge.Attribute(w + "val")?.Value;
+                if (val == "restart") style.IsVerticalMergeRestart = true;
+                else style.IsVerticalMergeContinue = true;
+            }
+
+            // Borders
+            var tcBorders = tcPr.Element(w + "tcBorders");
+            if (tcBorders != null)
+            {
+                ProcessBorder(tcBorders.Element(w + "top"), out style.TopBorderSize, out style.TopBorderColor);
+                ProcessBorder(tcBorders.Element(w + "bottom"), out style.BottomBorderSize, out style.BottomBorderColor);
+                ProcessBorder(tcBorders.Element(w + "left"), out style.LeftBorderSize, out style.LeftBorderColor);
+                ProcessBorder(tcBorders.Element(w + "right"), out style.RightBorderSize, out style.RightBorderColor);
+            }
+        }
+
+        return style;
+    }
+
+    private class NumberingLevel
+    {
+        public int LevelIndex;
+        public string Start;
+        public string NumberFormat;
+        public string LevelText;
+        public float Indent;
+        public float Hanging;
+    }
+
+    private class NumberingDefinition
+    {
+        public int AbstractNumId;
+        public Dictionary<int, NumberingLevel> Levels = new();
+    }
+
+    private Dictionary<int, int> _numIdToAbstractId = new();
+    private Dictionary<int, NumberingDefinition> _abstractNumbering = new();
+
+    private void LoadNumberingDefinitions(Stream docxStream)
+    {
+        _numIdToAbstractId.Clear();
+        _abstractNumbering.Clear();
+
+        try
+        {
+            using (var archive = new ZipArchive(docxStream, ZipArchiveMode.Read, true))
+            {
+                var entry = archive.GetEntry("word/numbering.xml");
+                if (entry == null) return;
+
+                using (var stream = entry.Open())
+                {
+                    var doc = XDocument.Load(stream);
+                    XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+                    // Parse abstractNum
+                    foreach (var abstractNum in doc.Descendants(w + "abstractNum"))
+                    {
+                        var idVal = abstractNum.Attribute(w + "abstractNumId")?.Value;
+                        if (!int.TryParse(idVal, out int id)) continue;
+
+                        var def = new NumberingDefinition { AbstractNumId = id };
+                        foreach (var lvl in abstractNum.Descendants(w + "lvl"))
+                        {
+                            var ilvlVal = lvl.Attribute(w + "ilvl")?.Value;
+                            if (!int.TryParse(ilvlVal, out int ilvl)) continue;
+
+                            var level = new NumberingLevel
+                            {
+                                LevelIndex = ilvl,
+                                Start = lvl.Element(w + "start")?.Attribute(w + "val")?.Value ?? "1",
+                                NumberFormat = lvl.Element(w + "numFmt")?.Attribute(w + "val")?.Value ?? "decimal",
+                                LevelText = lvl.Element(w + "lvlText")?.Attribute(w + "val")?.Value ?? ""
+                            };
+
+                            var pPr = lvl.Element(w + "pPr");
+                            if (pPr != null)
+                            {
+                                var ind = pPr.Element(w + "ind");
+                                if (ind != null)
+                                {
+                                    if (float.TryParse(ind.Attribute(w + "left")?.Value, out float left)) level.Indent = left * TWIPS_TO_POINTS;
+                                    if (float.TryParse(ind.Attribute(w + "hanging")?.Value, out float hanging)) level.Hanging = hanging * TWIPS_TO_POINTS;
+                                }
+                            }
+                            def.Levels[ilvl] = level;
+                        }
+                        _abstractNumbering[id] = def;
+                    }
+
+                    // Parse num (maps numId to abstractNumId)
+                    foreach (var num in doc.Descendants(w + "num"))
+                    {
+                        var idVal = num.Attribute(w + "numId")?.Value;
+                        var abstractIdVal = num.Element(w + "abstractNumId")?.Attribute(w + "val")?.Value;
+
+                        if (int.TryParse(idVal, out int id) && int.TryParse(abstractIdVal, out int abstractId))
+                        {
+                            _numIdToAbstractId[id] = abstractId;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to load numbering definitions: {ex.Message}");
+        }
+    }
+
+    private Dictionary<int, Dictionary<int, int>> _numCounters = new();
+
+    private struct SectionProperties
+    {
+        public bool TitlePg; // First page different
+        public string? HeaderId;
+        public string? FirstPageHeaderId;
+        public string? FooterId;
+        public string? FirstPageFooterId;
+    }
+
+    private SectionProperties _sectionProps;
+    private Dictionary<string, string> _headerFooterContent = new();
+
+    private void LoadSectionProperties(Stream docxStream)
+    {
+        _sectionProps = new SectionProperties();
+        _headerFooterContent.Clear();
+
+        try
+        {
+            using (var archive = new ZipArchive(docxStream, ZipArchiveMode.Read, true))
+            {
+                var documentEntry = archive.GetEntry("word/document.xml");
+                if (documentEntry == null) return;
+
+                using (var stream = documentEntry.Open())
+                {
+                    var doc = XDocument.Load(stream);
+                    XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+                    XNamespace r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+                    var sectPr = doc.Descendants(w + "sectPr").LastOrDefault();
+                    if (sectPr != null)
+                    {
+                        _sectionProps.TitlePg = sectPr.Element(w + "titlePg") != null;
+
+                        foreach (var hdr in sectPr.Elements(w + "headerReference"))
+                        {
+                            var type = hdr.Attribute(w + "type")?.Value;
+                            var id = hdr.Attribute(r + "id")?.Value;
+                            if (type == "default") _sectionProps.HeaderId = id;
+                            else if (type == "first") _sectionProps.FirstPageHeaderId = id;
+                        }
+
+                        foreach (var ftr in sectPr.Elements(w + "footerReference"))
+                        {
+                            var type = ftr.Attribute(w + "type")?.Value;
+                            var id = ftr.Attribute(r + "id")?.Value;
+                            if (type == "default") _sectionProps.FooterId = id;
+                            else if (type == "first") _sectionProps.FirstPageFooterId = id;
+                        }
+                    }
+                }
+
+                // Load Relationship mapping to find filenames
+                var relsEntry = archive.GetEntry("word/_rels/document.xml.rels");
+                if (relsEntry != null)
+                {
+                    using (var relsStream = relsEntry.Open())
+                    {
+                        var relsDoc = XDocument.Load(relsStream);
+                        XNamespace relsNs = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+                        var relMap = relsDoc.Descendants(relsNs + "Relationship")
+                            .ToDictionary(x => x.Attribute("Id")?.Value ?? "", x => x.Attribute("Target")?.Value ?? "");
+
+                        // Load actual content
+                        LoadHdrFtrContent(archive, relMap, _sectionProps.HeaderId);
+                        LoadHdrFtrContent(archive, relMap, _sectionProps.FirstPageHeaderId);
+                        LoadHdrFtrContent(archive, relMap, _sectionProps.FooterId);
+                        LoadHdrFtrContent(archive, relMap, _sectionProps.FirstPageFooterId);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to load section properties: {ex.Message}");
+        }
+    }
+
+    private void LoadHdrFtrContent(ZipArchive archive, Dictionary<string, string> relMap, string? id)
+    {
+        if (string.IsNullOrEmpty(id) || !relMap.TryGetValue(id, out var target)) return;
+
+        var path = target.StartsWith("/") ? target.Substring(1) : "word/" + target;
+        var entry = archive.GetEntry(path);
+        if (entry == null) return;
+
+        using (var stream = entry.Open())
+        {
+            var doc = XDocument.Load(stream);
+            XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+            // Extract text content from the header/footer
+            var text = string.Join(" ", doc.Descendants(w + "t").Select(t => t.Value));
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                _headerFooterContent[id] = text;
+            }
+        }
+    }
+
+    private void RenderListItem(ColumnDescriptor column, Paragraph paragraph)
+    {
+        int numId = paragraph.Xml?.Descendants(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "numPr")
+                             .Elements(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "numId")
+                             .Select(e => int.TryParse(e.Attribute(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "val")?.Value, out int id) ? id : 0)
+                             .FirstOrDefault() ?? 0;
+
+        int ilvl = paragraph.IndentLevel ?? 0;
+
+        NumberingLevel? lvlDef = null;
+        if (numId > 0 && _numIdToAbstractId.TryGetValue(numId, out int abstractId))
+        {
+            if (_abstractNumbering.TryGetValue(abstractId, out var def) && def.Levels.TryGetValue(ilvl, out var level))
+            {
+                lvlDef = level;
+            }
+        }
+
+        // Increment counter
+        int counter = 1;
+        if (numId > 0)
+        {
+            if (!_numCounters.ContainsKey(numId)) _numCounters[numId] = new();
+            if (!_numCounters[numId].ContainsKey(ilvl)) _numCounters[numId][ilvl] = 0;
+            _numCounters[numId][ilvl]++;
+            counter = _numCounters[numId][ilvl];
+
+            // Reset sub-levels
+            for (int i = ilvl + 1; i < 10; i++)
+            {
+                if (_numCounters[numId].ContainsKey(i)) _numCounters[numId][i] = 0;
+            }
+        }
+
+        string marker = GetListMarker(lvlDef, counter);
+        float indent = lvlDef?.Indent ?? (ilvl * 20f);
+        float hanging = lvlDef?.Hanging ?? 15f;
+
+        column.Item().PaddingTop(3).PaddingBottom(3).PaddingLeft(indent).Row(row =>
+        {
+            row.ConstantItem(hanging).Text(marker).FontSize(11);
+            row.RelativeItem().Text(text =>
+            {
+                ProcessTextRuns(text, paragraph);
+                ApplyAlignment(text, paragraph.Alignment);
+            });
+        });
+    }
+
+    private string GetListMarker(NumberingLevel? lvl, int counter)
+    {
+        if (lvl == null) return "•";
+
+        var format = lvl.NumberFormat;
+        var text = lvl.LevelText;
+
+        if (format == "bullet")
+        {
+            if (text == "o") return "○";
+            if (text == "·") return "•";
+            return text.Length > 0 ? text[0].ToString() : "•";
+        }
+
+        string value = counter.ToString();
+        if (format == "lowerLetter") value = ((char)('a' + (counter - 1))).ToString();
+        else if (format == "upperLetter") value = ((char)('A' + (counter - 1))).ToString();
+        else if (format == "lowerRoman") value = ToRoman(counter).ToLower();
+        else if (format == "upperRoman") value = ToRoman(counter);
+
+        if (!string.IsNullOrEmpty(text))
+        {
+            return text.Replace($"%{lvl.LevelIndex + 1}", value);
+        }
+
+        return value + ".";
+    }
+
+    private string ToRoman(int number)
+    {
+        if (number <= 0) return number.ToString();
+        if (number >= 1000) return "M" + ToRoman(number - 1000);
+        if (number >= 900) return "CM" + ToRoman(number - 900);
+        if (number >= 500) return "D" + ToRoman(number - 500);
+        if (number >= 400) return "CD" + ToRoman(number - 400);
+        if (number >= 100) return "C" + ToRoman(number - 100);
+        if (number >= 90) return "XC" + ToRoman(number - 90);
+        if (number >= 50) return "L" + ToRoman(number - 50);
+        if (number >= 40) return "XL" + ToRoman(number - 40);
+        if (number >= 10) return "X" + ToRoman(number - 10);
+        if (number >= 9) return "IX" + ToRoman(number - 9);
+        if (number >= 5) return "V" + ToRoman(number - 5);
+        if (number >= 4) return "IV" + ToRoman(number - 4);
+        if (number >= 1) return "I" + ToRoman(number - 1);
+        return string.Empty;
+    }
+
+    private void RenderTable(ColumnDescriptor parentColumn, Table table)
+    {
+        int totalGridColumns = 0;
+        if (table.Rows.Count > 0)
+        {
+            totalGridColumns = table.Rows[0].Cells.Sum(c => ExtractCellStyle(c).GridSpan);
+        }
+
+        if (totalGridColumns <= 0) return;
+
+        parentColumn.Item().PaddingVertical(8).Table(tableElement =>
+        {
+            tableElement.ColumnsDefinition(columns =>
+            {
+                for (int i = 0; i < totalGridColumns; i++)
+                {
+                    columns.RelativeColumn();
+                }
+            });
+
+            // Track vertical merges: grid column index -> (rowSpanCount, cellElement)
+            // Since QuestPDF RowSpan needs to know the count upfront, we have to look ahead.
+            var rowOccupancy = new bool[table.Rows.Count + 1, totalGridColumns + 1];
+
+            for (int rowIndex = 0; rowIndex < table.Rows.Count; rowIndex++)
+            {
+                var row = table.Rows[rowIndex];
+                int currentGridCol = 1;
+
+                for (int cellIndex = 0; cellIndex < row.Cells.Count; cellIndex++)
+                {
+                    var cell = row.Cells[cellIndex];
+                    var style = ExtractCellStyle(cell);
+
+                    // Find next available grid column
+                    while (currentGridCol <= totalGridColumns && rowOccupancy[rowIndex + 1, currentGridCol])
+                    {
+                        currentGridCol++;
+                    }
+                    if (currentGridCol > totalGridColumns) break;
+
+                    if (style.IsVerticalMergeRestart)
+                    {
+                        // Look ahead to find RowSpan
+                        int rowSpan = 1;
+                        for (int nextRowIdx = rowIndex + 1; nextRowIdx < table.Rows.Count; nextRowIdx++)
+                        {
+                            // We need to check the cell at the same horizontal position
+                            // DocX doesn't make this easy. We'll check the cell and its XML
+                            var nextRow = table.Rows[nextRowIdx];
+                            // This is still complex because cell indices shift.
+                            // For now, let's stick to the grid occupancy we can detect.
+                        }
+
+                        // Marking occupancy (simplification: if it's restart, we mark it.
+                        // If it's continue, we mark it.)
+                    }
+
+                    // Mark occupancy for this cell's grid area
+                    for (int i = 0; i < style.GridSpan; i++)
+                    {
+                        if (currentGridCol + i <= totalGridColumns)
+                            rowOccupancy[rowIndex + 1, currentGridCol + i] = true;
+                    }
+
+                    if (style.IsVerticalMergeContinue)
+                    {
+                        currentGridCol += style.GridSpan;
+                        continue;
+                    }
+
+                    var cellElement = tableElement.Cell()
+                        .Row((uint)(rowIndex + 1))
+                        .Column((uint)currentGridCol)
+                        .ColumnSpan((uint)style.GridSpan);
+
+                    QuestPDF.Infrastructure.IContainer container = cellElement;
+
+                    // Apply Borders
+                    if (style.TopBorderSize > 0) container = container.BorderTop(style.TopBorderSize).BorderColor("#" + style.TopBorderColor);
+                    if (style.BottomBorderSize > 0) container = container.BorderBottom(style.BottomBorderSize).BorderColor("#" + style.BottomBorderColor);
+                    if (style.LeftBorderSize > 0) container = container.BorderLeft(style.LeftBorderSize).BorderColor("#" + style.LeftBorderColor);
+                    if (style.RightBorderSize > 0) container = container.BorderRight(style.RightBorderSize).BorderColor("#" + style.RightBorderColor);
+
+                    container.Padding(5).Column(cellColumn =>
+                    {
+                        foreach (var cellParagraph in cell.Paragraphs)
+                        {
+                            RenderParagraph(cellColumn, cellParagraph);
+                        }
+                    });
+
+                    currentGridCol += style.GridSpan;
+                }
+            }
+        });
+    }
+
+    private void ProcessBorder(XElement? border, out float size, out string color)
+    {
+        size = 0.5f;
+        color = "000000";
+        if (border == null)
+        {
+            size = 0; // No border
+            return;
+        }
+
+        XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        var sz = border.Attribute(w + "sz")?.Value;
+        if (float.TryParse(sz, out float szVal))
+        {
+            // Border size in eighths of a point
+            size = szVal / 8f;
+        }
+
+        var col = border.Attribute(w + "color")?.Value;
+        if (!string.IsNullOrEmpty(col) && col != "auto")
+        {
+            color = col;
+        }
     }
 
     private void RenderParagraph(ColumnDescriptor column, Paragraph paragraph)
