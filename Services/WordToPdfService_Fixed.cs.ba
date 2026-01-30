@@ -16,7 +16,7 @@ public class WordToPdfService
 {
     private const float TWIPS_TO_POINTS = 1f / 20f;
     private const float EMUS_TO_POINTS = 1f / 12700f;
-
+    
     // Sections that must start on new pages
     private static readonly string[] NewPageSections = {
         "POLICY SCHEDULE",
@@ -231,7 +231,7 @@ public class WordToPdfService
                                     }
                                 }
                             });
-
+                            
                             // Right side: Policy number - only if not already in header
                             row.RelativeItem().AlignRight().Text(text =>
                             {
@@ -305,16 +305,16 @@ public class WordToPdfService
 
         // Remove common duplicates and clean up
         var cleaned = footerText;
-
+        
         // Remove page numbers that might be embedded
         cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"\b\d+\b", "").Trim();
-
+        
         // Remove insured name if it appears
-        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"VINCINTORE DENTAL CLINIC LIMITED", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
-
+        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"VINCINTORE DENTAL CLINIC LIMITED", "", StringComparison.OrdinalIgnoreCase).Trim();
+        
         // Remove "Authorised and regulated" text
-        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"Authorised and regulated.*", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
-
+        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"Authorised and regulated.*", "", StringComparison.OrdinalIgnoreCase).Trim();
+        
         // If nothing left, use default
         if (string.IsNullOrWhiteSpace(cleaned))
         {
@@ -333,8 +333,8 @@ public class WordToPdfService
 
         // Remove duplicate "POLICY NO:" patterns
         var cleaned = System.Text.RegularExpressions.Regex.Replace(
-            text,
-            @"POLICY NO:\s*[^\s]+\s*POLICY NO:\s*[^\s]+",
+            text, 
+            @"POLICY NO:\s*[^\s]+\s*POLICY NO:\s*[^\s]+", 
             match =>
             {
                 // Keep only the first occurrence
@@ -515,361 +515,258 @@ public class WordToPdfService
         bool insideImportantSection = false;
         List<Paragraph> importantParagraphs = new();
 
-        XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-        // CRITICAL FIX: Process elements in document order
-        // Xceed.Words.NET's wordDocument.Xml IS the body element directly
-        XElement? bodyXml = null;
-
-        if (wordDocument.Xml != null)
-        {
-            // Approach 1: If wordDocument.Xml IS the body element (most common case)
-            if (wordDocument.Xml.Name.LocalName == "body")
-            {
-                bodyXml = wordDocument.Xml;
-            }
-            // Approach 2: Body is a direct child of document
-            else if (wordDocument.Xml.Name.LocalName == "document")
-            {
-                bodyXml = wordDocument.Xml.Element(w + "body");
-            }
-            // Approach 3: Search descendants
-            if (bodyXml == null)
-            {
-                bodyXml = wordDocument.Xml.Descendants(w + "body").FirstOrDefault();
-            }
-            // Approach 4: Just iterate all child elements if it contains p/tbl
-            if (bodyXml == null && wordDocument.Xml.Elements().Any(e => e.Name.LocalName == "p" || e.Name.LocalName == "tbl"))
-            {
-                bodyXml = wordDocument.Xml;
-            }
-        }
-
-        if (bodyXml == null)
-        {
-            Console.WriteLine("WARNING: Could not access document XML body, tables may render out of order");
-            ProcessAllParagraphsThenTables(column, wordDocument, paragraphsInTables, allTables);
-            return;
-        }
-
-        int tableCount = 0;
-
-        // Process elements in document order (paragraphs AND tables interleaved)
-        foreach (var element in bodyXml.Elements())
-        {
-            var tagName = element.Name.LocalName;
-
-            if (tagName == "p")  // Paragraph
-            {
-                // Find the corresponding Paragraph object by comparing XML
-                var paragraph = wordDocument.Paragraphs.FirstOrDefault(p => p.Xml == element);
-                if (paragraph == null)
-                {
-                    // Try matching by text content as fallback
-                    var elementText = string.Join("", element.Descendants(w + "t").Select(t => t.Value));
-                    paragraph = wordDocument.Paragraphs.FirstOrDefault(p => p.Text == elementText);
-                }
-                if (paragraph == null) continue;
-
-                if (paragraphsInTables.Contains(paragraph))
-                    continue;
-
-                ProcessSingleParagraph(column, wordDocument, paragraph, ref insideImportantSection, ref importantParagraphs);
-            }
-            else if (tagName == "tbl")  // Table
-            {
-                tableCount++;
-
-                // Find the corresponding Table object
-                var table = allTables.FirstOrDefault(t => t.Xml == element);
-                if (table == null && allTables.Count >= tableCount)
-                {
-                    // Fallback: use table by index
-                    table = allTables[tableCount - 1];
-                }
-                if (table == null) continue;
-
-                // Close IMPORTANT section before table
-                if (insideImportantSection && importantParagraphs.Count > 0)
-                {
-                    RenderImportantBox(column, importantParagraphs);
-                    importantParagraphs.Clear();
-                    insideImportantSection = false;
-                }
-
-                column.Item().PaddingVertical(10);
-                RenderTable(column, table);
-            }
-        }
-
-        // Render remaining IMPORTANT section
-        if (insideImportantSection && importantParagraphs.Count > 0)
-        {
-            RenderImportantBox(column, importantParagraphs);
-        }
-    }
-
-    // NEW HELPER METHOD: Extract single paragraph processing logic
-    private void ProcessSingleParagraph(ColumnDescriptor column, DocX wordDocument, Paragraph paragraph,
-                                       ref bool insideImportantSection, ref List<Paragraph> importantParagraphs)
-    {
-        var paragraphText = paragraph.Text?.Trim() ?? string.Empty;
-
-        // Forced page breaks for major sections
-        foreach (var section in NewPageSections)
-        {
-            if (paragraphText.StartsWith(section, StringComparison.OrdinalIgnoreCase))
-            {
-                if (insideImportantSection && importantParagraphs.Count > 0)
-                {
-                    RenderImportantBox(column, importantParagraphs);
-                    importantParagraphs.Clear();
-                    insideImportantSection = false;
-                }
-                column.Item().PageBreak();
-                break;
-            }
-        }
-
-        // Page breaks (form feed characters)
-        if (paragraph.Text?.Contains("\f") == true || paragraph.Text?.Contains("\x0C") == true)
-        {
-            if (insideImportantSection && importantParagraphs.Count > 0)
-            {
-                RenderImportantBox(column, importantParagraphs);
-                importantParagraphs.Clear();
-                insideImportantSection = false;
-            }
-
-            column.Item().PageBreak();
-            if (string.IsNullOrWhiteSpace(paragraph.Text?.Replace("\f", "").Replace("\x0C", "")))
-                return;
-        }
-
-        // Images
-        IList<Picture> pictures = null;
-        bool manualExtractionNeeded = false;
-        try
-        {
-           pictures = paragraph.Pictures;
-        }
-        catch
-        {
-            manualExtractionNeeded = true;
-        }
-
-        if (!manualExtractionNeeded && pictures != null && pictures.Count > 0)
-        {
-            foreach (var picture in pictures)
-            {
-                try
-                {
-                    var imageId = picture.Id;
-                    ProcessImage(column, wordDocument, imageId, null, null);
-                }
-                catch { /* Skip failed images */ }
-            }
-
-            if (string.IsNullOrWhiteSpace(paragraphText))
-                return;
-        }
-        else if (manualExtractionNeeded)
-        {
-             try
-             {
-                 var manualImages = ManuallyExtractImages(paragraph);
-                 if (manualImages.Count > 0)
-                 {
-                     foreach (var img in manualImages)
-                     {
-                         ProcessImage(column, wordDocument, img.Id, img.Width, img.Height);
-                     }
-
-                     if (string.IsNullOrWhiteSpace(paragraphText))
-                        return;
-                 }
-             }
-             catch (Exception ex)
-             {
-                 Console.WriteLine($"Manual image extraction failed: {ex.Message}");
-             }
-        }
-
-        // FIXED: Better empty paragraph handling with consistent spacing
-        if (string.IsNullOrWhiteSpace(paragraphText))
-        {
-            float spacingAfter = GetParagraphSpacingAfter(paragraph);
-            column.Item().Height(spacingAfter > 0 ? Math.Max(spacingAfter, 4) : 6);
-            return;
-        }
-
-        // Detect IMPORTANT section
-        if (paragraphText.Equals("IMPORTANT", StringComparison.OrdinalIgnoreCase))
-        {
-            insideImportantSection = true;
-            importantParagraphs.Add(paragraph);
-            return;
-        }
-
-        // Collect IMPORTANT section content
-        if (insideImportantSection)
-        {
-            bool isEndOfImportant =
-                paragraphText.StartsWith("Followed by", StringComparison.OrdinalIgnoreCase) ||
-                paragraphText.StartsWith("PLEASE NOTE", StringComparison.OrdinalIgnoreCase) ||
-                paragraphText.StartsWith("POLICY CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
-                paragraphText.StartsWith("Section A", StringComparison.OrdinalIgnoreCase) ||
-                IsInsuranceTypeHeading(paragraphText);
-
-            if (isEndOfImportant)
-            {
-                RenderImportantBox(column, importantParagraphs);
-                importantParagraphs.Clear();
-                insideImportantSection = false;
-            }
-            else
-            {
-                importantParagraphs.Add(paragraph);
-                return;
-            }
-        }
-
-        // Label-value pairs
-        if (IsLabelValuePair(paragraphText))
-        {
-            RenderLabelValuePair(column, paragraph);
-            return;
-        }
-
-        // FIXED: Period of insurance handling
-        if (paragraphText.StartsWith("PERIOD OF", StringComparison.OrdinalIgnoreCase))
-        {
-            column.Item().PaddingTop(10).PaddingBottom(4).Row(row =>
-            {
-                row.ConstantItem(160).Text(text => text.Span("PERIOD OF").Bold().FontSize(11));
-                row.RelativeItem();
-            });
-            return;
-        }
-
-        if (paragraphText.StartsWith("INSURANCE:", StringComparison.OrdinalIgnoreCase))
-        {
-            var value = paragraphText.Substring(10).Trim();
-            column.Item().PaddingBottom(4).Row(row =>
-            {
-                row.ConstantItem(160).Text(text => text.Span("INSURANCE:").Bold().FontSize(11));
-                row.RelativeItem().Text(value).FontSize(11);
-            });
-            return;
-        }
-
-        if (paragraphText.StartsWith("FROM:", StringComparison.OrdinalIgnoreCase))
-        {
-            var value = paragraphText.Substring(5).Trim();
-            column.Item().PaddingBottom(2).PaddingLeft(160).Text($"FROM: {value}").FontSize(11);
-            return;
-        }
-
-        if (paragraphText.StartsWith("TO:", StringComparison.OrdinalIgnoreCase) && paragraphText.Length < 50)
-        {
-            var value = paragraphText.Substring(3).Trim();
-            column.Item().PaddingBottom(8).PaddingLeft(160).Text($"TO: {value}").FontSize(11);
-            return;
-        }
-
-        // Heading detection
-        bool isStyleHeading = paragraph.StyleId?.Contains("Heading") == true;
-        bool isValidHeading = IsValidHeading(paragraphText, paragraph, isStyleHeading);
-
-        if (isValidHeading)
-        {
-            var alignment = paragraph.Alignment;
-            float fontSize = 14;
-            float paddingTop = GetParagraphSpacingBefore(paragraph);
-            float paddingBottom = GetParagraphSpacingAfter(paragraph);
-
-            if (paddingTop <= 0) paddingTop = 12;
-            if (paddingBottom <= 0) paddingBottom = 8;
-
-            if (isStyleHeading && paragraph.StyleId != null)
-            {
-                if (paragraph.StyleId.Contains("1")) { fontSize = 16; paddingTop = 16; }
-                else if (paragraph.StyleId.Contains("2")) { fontSize = 14; paddingTop = 14; }
-                else if (paragraph.StyleId.Contains("3")) { fontSize = 13; paddingTop = 12; }
-                else { fontSize = 12; paddingTop = 10; }
-            }
-            else if (IsInsuranceTypeHeading(paragraphText))
-            {
-                fontSize = 16;
-                paddingTop = 20;
-                paddingBottom = 16;
-                alignment = Alignment.center;
-            }
-            else if (paragraphText.StartsWith("MEMO", StringComparison.OrdinalIgnoreCase))
-            {
-                fontSize = 13;
-                paddingTop = 14;
-                paddingBottom = 8;
-            }
-
-            column.Item().PaddingTop(paddingTop).PaddingBottom(paddingBottom).Text(text =>
-            {
-                text.Span(paragraphText).Bold().FontSize(fontSize);
-                ApplyAlignment(text, alignment);
-            });
-            return;
-        }
-
-        // Section headings (bold, short)
-        bool isBold = paragraph.MagicText.Count > 0 &&
-                      paragraph.MagicText.All(r => r.formatting?.Bold == true);
-        bool isBoldShort = paragraphText.Length < 60 && isBold &&
-                           !IsExcludedFromHeading(paragraphText) &&
-                           !paragraphText.EndsWith(":-") &&
-                           !paragraphText.EndsWith(":") &&
-                           paragraph.MagicText.Count <= 3;
-
-        if (isBoldShort && !paragraph.IsListItem && !IsAllCaps(paragraphText))
-        {
-            column.Item().PaddingTop(8).PaddingBottom(4).Text(text =>
-            {
-                ProcessTextRuns(text, paragraph);
-                ApplyAlignment(text, paragraph.Alignment);
-            });
-            return;
-        }
-
-        // List items
-        if (paragraph.IsListItem)
-        {
-            RenderListItem(column, paragraph);
-            return;
-        }
-
-        // Regular paragraphs
-        RenderParagraph(column, paragraph);
-    }
-
-    // FALLBACK METHOD: Old behavior if XML access fails
-    private void ProcessAllParagraphsThenTables(ColumnDescriptor column, DocX wordDocument,
-                                               HashSet<Paragraph> paragraphsInTables, List<Table> allTables)
-    {
-        bool insideImportantSection = false;
-        List<Paragraph> importantParagraphs = new();
-
         foreach (var paragraph in wordDocument.Paragraphs)
         {
             if (paragraphsInTables.Contains(paragraph))
                 continue;
 
-            ProcessSingleParagraph(column, wordDocument, paragraph, ref insideImportantSection, ref importantParagraphs);
+            var paragraphText = paragraph.Text?.Trim() ?? string.Empty;
+
+            // Forced page breaks for major sections
+            foreach (var section in NewPageSections)
+            {
+                if (paragraphText.StartsWith(section, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (insideImportantSection && importantParagraphs.Count > 0)
+                    {
+                        RenderImportantBox(column, importantParagraphs);
+                        importantParagraphs.Clear();
+                        insideImportantSection = false;
+                    }
+                    column.Item().PageBreak();
+                    break;
+                }
+            }
+
+            // Page breaks (form feed characters)
+            if (paragraph.Text?.Contains("\f") == true || paragraph.Text?.Contains("\x0C") == true)
+            {
+                if (insideImportantSection && importantParagraphs.Count > 0)
+                {
+                    RenderImportantBox(column, importantParagraphs);
+                    importantParagraphs.Clear();
+                    insideImportantSection = false;
+                }
+
+                column.Item().PageBreak();
+                if (string.IsNullOrWhiteSpace(paragraph.Text?.Replace("\f", "").Replace("\x0C", "")))
+                    continue;
+            }
+
+            // Images
+            IList<Picture> pictures = null;
+            bool manualExtractionNeeded = false;
+            try
+            {
+               pictures = paragraph.Pictures;
+            }
+            catch
+            {
+                manualExtractionNeeded = true;
+            }
+
+            if (!manualExtractionNeeded && pictures != null && pictures.Count > 0)
+            {
+                foreach (var picture in pictures)
+                {
+                    try
+                    {
+                        var imageId = picture.Id;
+                        ProcessImage(column, wordDocument, imageId, null, null);
+                    }
+                    catch { /* Skip failed images */ }
+                }
+
+                if (string.IsNullOrWhiteSpace(paragraphText))
+                    continue;
+            }
+            else if (manualExtractionNeeded)
+            {
+                 try
+                 {
+                     var manualImages = ManuallyExtractImages(paragraph);
+                     if (manualImages.Count > 0)
+                     {
+                         foreach (var img in manualImages)
+                         {
+                             ProcessImage(column, wordDocument, img.Id, img.Width, img.Height);
+                         }
+
+                         if (string.IsNullOrWhiteSpace(paragraphText))
+                            continue;
+                     }
+                 }
+                 catch (Exception ex)
+                 {
+                     Console.WriteLine($"Manual image extraction failed: {ex.Message}");
+                 }
+            }
+
+            // FIXED: Better empty paragraph handling with consistent spacing
+            if (string.IsNullOrWhiteSpace(paragraphText))
+            {
+                float spacingAfter = GetParagraphSpacingAfter(paragraph);
+                // Minimum spacing for readability
+                column.Item().Height(spacingAfter > 0 ? Math.Max(spacingAfter, 4) : 6);
+                continue;
+            }
+
+            // Detect IMPORTANT section
+            if (paragraphText.Equals("IMPORTANT", StringComparison.OrdinalIgnoreCase))
+            {
+                insideImportantSection = true;
+                importantParagraphs.Add(paragraph);
+                continue;
+            }
+
+            // Collect IMPORTANT section content
+            if (insideImportantSection)
+            {
+                bool isEndOfImportant =
+                    paragraphText.StartsWith("Followed by", StringComparison.OrdinalIgnoreCase) ||
+                    paragraphText.StartsWith("PLEASE NOTE", StringComparison.OrdinalIgnoreCase) ||
+                    paragraphText.StartsWith("POLICY CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
+                    paragraphText.StartsWith("Section A", StringComparison.OrdinalIgnoreCase) ||
+                    IsInsuranceTypeHeading(paragraphText);
+
+                if (isEndOfImportant)
+                {
+                    RenderImportantBox(column, importantParagraphs);
+                    importantParagraphs.Clear();
+                    insideImportantSection = false;
+                }
+                else
+                {
+                    importantParagraphs.Add(paragraph);
+                    continue;
+                }
+            }
+
+            // Label-value pairs
+            if (IsLabelValuePair(paragraphText))
+            {
+                RenderLabelValuePair(column, paragraph);
+                continue;
+            }
+
+            // FIXED: Period of insurance handling - improved layout
+            if (paragraphText.StartsWith("PERIOD OF", StringComparison.OrdinalIgnoreCase))
+            {
+                column.Item().PaddingTop(10).PaddingBottom(4).Row(row =>
+                {
+                    row.ConstantItem(160).Text(text => text.Span("PERIOD OF").Bold().FontSize(11));
+                    row.RelativeItem();
+                });
+                continue;
+            }
+
+            if (paragraphText.StartsWith("INSURANCE:", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = paragraphText.Substring(10).Trim();
+                column.Item().PaddingBottom(4).Row(row =>
+                {
+                    row.ConstantItem(160).Text(text => text.Span("INSURANCE:").Bold().FontSize(11));
+                    row.RelativeItem().Text(value).FontSize(11);
+                });
+                continue;
+            }
+
+            if (paragraphText.StartsWith("FROM:", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = paragraphText.Substring(5).Trim();
+                column.Item().PaddingBottom(2).PaddingLeft(160).Text($"FROM: {value}").FontSize(11);
+                continue;
+            }
+
+            if (paragraphText.StartsWith("TO:", StringComparison.OrdinalIgnoreCase) && paragraphText.Length < 50)
+            {
+                var value = paragraphText.Substring(3).Trim();
+                column.Item().PaddingBottom(8).PaddingLeft(160).Text($"TO: {value}").FontSize(11);
+                continue;
+            }
+
+            // Heading detection
+            bool isStyleHeading = paragraph.StyleId?.Contains("Heading") == true;
+            bool isValidHeading = IsValidHeading(paragraphText, paragraph, isStyleHeading);
+
+            if (isValidHeading)
+            {
+                var alignment = paragraph.Alignment;
+                float fontSize = 14;
+                float paddingTop = GetParagraphSpacingBefore(paragraph);
+                float paddingBottom = GetParagraphSpacingAfter(paragraph);
+                
+                // FIXED: Better default spacing for headings
+                if (paddingTop <= 0) paddingTop = 12;
+                if (paddingBottom <= 0) paddingBottom = 8;
+
+                if (isStyleHeading && paragraph.StyleId != null)
+                {
+                    if (paragraph.StyleId.Contains("1")) { fontSize = 16; paddingTop = 16; }
+                    else if (paragraph.StyleId.Contains("2")) { fontSize = 14; paddingTop = 14; }
+                    else if (paragraph.StyleId.Contains("3")) { fontSize = 13; paddingTop = 12; }
+                    else { fontSize = 12; paddingTop = 10; }
+                }
+                else if (IsInsuranceTypeHeading(paragraphText))
+                {
+                    fontSize = 16;
+                    paddingTop = 20;
+                    paddingBottom = 16;
+                    alignment = Alignment.center;
+                }
+                else if (paragraphText.StartsWith("MEMO", StringComparison.OrdinalIgnoreCase))
+                {
+                    fontSize = 13;
+                    paddingTop = 14;
+                    paddingBottom = 8;
+                }
+
+                column.Item().PaddingTop(paddingTop).PaddingBottom(paddingBottom).Text(text =>
+                {
+                    text.Span(paragraphText).Bold().FontSize(fontSize);
+                    ApplyAlignment(text, alignment);
+                });
+                continue;
+            }
+
+            // Section headings (bold, short)
+            bool isBold = paragraph.MagicText.Count > 0 &&
+                          paragraph.MagicText.All(r => r.formatting?.Bold == true);
+            bool isBoldShort = paragraphText.Length < 60 && isBold &&
+                               !IsExcludedFromHeading(paragraphText) &&
+                               !paragraphText.EndsWith(":-") &&
+                               !paragraphText.EndsWith(":") &&
+                               paragraph.MagicText.Count <= 3;
+
+            if (isBoldShort && !paragraph.IsListItem && !IsAllCaps(paragraphText))
+            {
+                // FIXED: Add spacing for bold section headings
+                column.Item().PaddingTop(8).PaddingBottom(4).Text(text =>
+                {
+                    ProcessTextRuns(text, paragraph);
+                    ApplyAlignment(text, paragraph.Alignment);
+                });
+                continue;
+            }
+
+            // List items
+            if (paragraph.IsListItem)
+            {
+                RenderListItem(column, paragraph);
+                continue;
+            }
+
+            // Regular paragraphs
+            RenderParagraph(column, paragraph);
         }
 
+        // Render any remaining IMPORTANT section
         if (insideImportantSection && importantParagraphs.Count > 0)
         {
             RenderImportantBox(column, importantParagraphs);
         }
 
+        // FIXED: Tables - render with better spacing
         foreach (var table in allTables)
         {
             column.Item().PaddingVertical(10);
@@ -1557,13 +1454,13 @@ public class WordToPdfService
                     QuestPDF.Infrastructure.IContainer container = cellElement;
 
                     // Apply borders - FIXED: Only apply if border size > 0
-                    if (style.TopBorderSize > 0)
+                    if (style.TopBorderSize > 0) 
                         container = container.BorderTop(style.TopBorderSize).BorderColor("#" + style.TopBorderColor);
-                    if (style.BottomBorderSize > 0)
+                    if (style.BottomBorderSize > 0) 
                         container = container.BorderBottom(style.BottomBorderSize).BorderColor("#" + style.BottomBorderColor);
-                    if (style.LeftBorderSize > 0)
+                    if (style.LeftBorderSize > 0) 
                         container = container.BorderLeft(style.LeftBorderSize).BorderColor("#" + style.LeftBorderColor);
-                    if (style.RightBorderSize > 0)
+                    if (style.RightBorderSize > 0) 
                         container = container.BorderRight(style.RightBorderSize).BorderColor("#" + style.RightBorderColor);
 
                     // FIXED: Better cell padding
@@ -1579,7 +1476,7 @@ public class WordToPdfService
                             foreach (var cellParagraph in cell.Paragraphs)
                             {
                                 var cellText = cellParagraph.Text?.Trim() ?? "";
-
+                                
                                 // Skip completely empty paragraphs in tables
                                 if (string.IsNullOrWhiteSpace(cellText))
                                 {
@@ -1621,11 +1518,11 @@ public class WordToPdfService
     {
         size = 0;
         color = "000000";
-
+        
         if (border == null) return;
 
         XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
+        
         var sz = border.Attribute(w + "sz")?.Value;
         if (float.TryParse(sz, out float szVal))
         {
@@ -1676,9 +1573,9 @@ public class WordToPdfService
                      .PaddingVertical(10)
                      .AlignCenter();
 
-                 if (width.HasValue && width.Value > 0)
+                 if (width.HasValue && width.Value > 0) 
                      imgContainer = imgContainer.MaxWidth(Math.Min(width.Value, 400));
-                 else
+                 else 
                      imgContainer = imgContainer.MaxWidth(200);
 
                  imgContainer.Image(imageBytes);
@@ -1690,8 +1587,7 @@ public class WordToPdfService
     {
         column.Item()
             .PaddingVertical(20)
-            .Background(Colors.Grey.Lighten4)
-            .Border(1.5f)
+            .Border(2)
             .BorderColor(Colors.Grey.Darken2)
             .Padding(24)
             .Column(boxColumn =>
@@ -1757,7 +1653,7 @@ public class WordToPdfService
 
             if (style.FontSize.HasValue) span.FontSize(style.FontSize.Value);
             else span.FontSize(11);
-
+            
             if (!string.IsNullOrEmpty(style.FontName)) span.FontFamily(style.FontName);
             if (!string.IsNullOrEmpty(style.Color)) span.FontColor("#" + style.Color);
         }
