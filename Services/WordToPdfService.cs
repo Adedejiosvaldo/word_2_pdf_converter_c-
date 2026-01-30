@@ -13,6 +13,8 @@ namespace WordToPdf.Services;
 /// </summary>
 public class WordToPdfService
 {
+    private const float TWIPS_TO_POINTS = 1f / 20f;
+    private const float EMUS_TO_POINTS = 1f / 12700f;
     // Sections that must start on new pages
     private static readonly string[] NewPageSections = {
         "POLICY SCHEDULE",
@@ -660,16 +662,7 @@ public class WordToPdfService
 
             if (isBoldShort && !paragraph.IsListItem && !IsAllCaps(paragraphText))
             {
-                float paddingTop = GetParagraphSpacingBefore(paragraph);
-                float paddingBottom = GetParagraphSpacingAfter(paragraph);
-                if (paddingTop <= 0) paddingTop = 10;
-                if (paddingBottom <= 0) paddingBottom = 4;
-
-                column.Item().PaddingTop(paddingTop).PaddingBottom(paddingBottom).Text(text =>
-                {
-                    ProcessTextRuns(text, paragraph);
-                    ApplyAlignment(text, paragraph.Alignment);
-                });
+                RenderParagraph(column, paragraph);
                 continue;
             }
 
@@ -725,24 +718,7 @@ public class WordToPdfService
             }
 
             // Regular paragraphs
-            float regPaddingTop = GetParagraphSpacingBefore(paragraph);
-            float regPaddingBottom = GetParagraphSpacingAfter(paragraph);
-            if (regPaddingTop <= 0) regPaddingTop = 3;
-            if (regPaddingBottom <= 0) regPaddingBottom = 3;
-
-            float paragraphIndent = (paragraph.IndentLevel ?? 0) * 20f;
-
-            var item = column.Item().PaddingTop(regPaddingTop).PaddingBottom(regPaddingBottom);
-            if (paragraphIndent > 0)
-            {
-                item = item.PaddingLeft(paragraphIndent);
-            }
-
-            item.Text(text =>
-            {
-                ProcessTextRuns(text, paragraph);
-                ApplyAlignment(text, paragraph.Alignment);
-            });
+            RenderParagraph(column, paragraph);
         }
 
         // Render any remaining IMPORTANT section
@@ -861,26 +837,14 @@ public class WordToPdfService
         return false;
     }
 
-    private static float GetParagraphSpacingBefore(Paragraph paragraph)
+    private float GetParagraphSpacingBefore(Paragraph paragraph)
     {
-        try
-        {
-            var lineSpacing = paragraph.LineSpacingBefore;
-            if (lineSpacing > 0) return (float)lineSpacing;
-        }
-        catch { }
-        return 0;
+        return ExtractParagraphStyle(paragraph).SpacingBefore ?? 0;
     }
 
-    private static float GetParagraphSpacingAfter(Paragraph paragraph)
+    private float GetParagraphSpacingAfter(Paragraph paragraph)
     {
-        try
-        {
-            var lineSpacing = paragraph.LineSpacingAfter;
-            if (lineSpacing > 0) return (float)lineSpacing;
-        }
-        catch { }
-        return 0;
+        return ExtractParagraphStyle(paragraph).SpacingAfter ?? 0;
     }
 
     private static bool IsLabelValuePair(string text)
@@ -894,7 +858,7 @@ public class WordToPdfService
         return false;
     }
 
-    private static void RenderLabelValuePair(ColumnDescriptor column, Paragraph paragraph)
+    private void RenderLabelValuePair(ColumnDescriptor column, Paragraph paragraph)
     {
         var text = paragraph.Text?.Trim() ?? string.Empty;
         var colonIdx = text.IndexOf(':');
@@ -952,8 +916,8 @@ public class WordToPdfService
                          var cy = ext.Attribute("cy")?.Value;
 
                          // EMU to Points: 1 pt = 12700 EMUs
-                         if (long.TryParse(cx, out long cxVal)) width = cxVal / 12700f;
-                         if (long.TryParse(cy, out long cyVal)) height = cyVal / 12700f;
+                         if (long.TryParse(cx, out long cxVal)) width = cxVal * EMUS_TO_POINTS;
+                         if (long.TryParse(cy, out long cyVal)) height = cyVal * EMUS_TO_POINTS;
                     }
                 }
 
@@ -962,6 +926,159 @@ public class WordToPdfService
         }
 
         return results;
+    }
+
+    private struct ParagraphStyle
+    {
+        public Alignment? Alignment;
+        public float? SpacingBefore;
+        public float? SpacingAfter;
+        public float? LineSpacing;
+        public float LeftIndent;
+        public float RightIndent;
+        public float HangingIndent;
+        public float FirstLineIndent;
+    }
+
+    private ParagraphStyle ExtractParagraphStyle(Paragraph paragraph)
+    {
+        var style = new ParagraphStyle
+        {
+            Alignment = paragraph.Alignment,
+            LeftIndent = paragraph.IndentationBefore * TWIPS_TO_POINTS,
+            RightIndent = paragraph.IndentationAfter * TWIPS_TO_POINTS,
+            SpacingBefore = (float)paragraph.LineSpacingBefore * TWIPS_TO_POINTS,
+            SpacingAfter = (float)paragraph.LineSpacingAfter * TWIPS_TO_POINTS
+        };
+
+        // Deep XML parsing for exact values (e.g. Line Spacing which library simplifies)
+        var pPr = paragraph.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "pPr");
+        if (pPr != null)
+        {
+            XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+            // Indentation
+            var ind = pPr.Element(w + "ind");
+            if (ind != null)
+            {
+                if (float.TryParse(ind.Attribute(w + "left")?.Value, out float left)) style.LeftIndent = left * TWIPS_TO_POINTS;
+                if (float.TryParse(ind.Attribute(w + "right")?.Value, out float right)) style.RightIndent = right * TWIPS_TO_POINTS;
+                if (float.TryParse(ind.Attribute(w + "hanging")?.Value, out float hanging)) style.HangingIndent = hanging * TWIPS_TO_POINTS;
+                if (float.TryParse(ind.Attribute(w + "firstLine")?.Value, out float first)) style.FirstLineIndent = first * TWIPS_TO_POINTS;
+            }
+
+            // Spacing
+            var spacing = pPr.Element(w + "spacing");
+            if (spacing != null)
+            {
+                if (float.TryParse(spacing.Attribute(w + "before")?.Value, out float before)) style.SpacingBefore = before * TWIPS_TO_POINTS;
+                if (float.TryParse(spacing.Attribute(w + "after")?.Value, out float after)) style.SpacingAfter = after * TWIPS_TO_POINTS;
+
+                var line = spacing.Attribute(w + "line")?.Value;
+                var lineRule = spacing.Attribute(w + "lineRule")?.Value;
+                if (float.TryParse(line, out float lineVal))
+                {
+                    // Interpretation depends on lineRule
+                    if (lineRule == "atLeast" || lineRule == "exact") style.LineSpacing = lineVal * TWIPS_TO_POINTS;
+                    else style.LineSpacing = lineVal / 240f * 12f; // Auto/Multiple
+                }
+            }
+
+            // Justification
+            var jc = pPr.Element(w + "jc");
+            if (jc != null)
+            {
+                var val = jc.Attribute(w + "val")?.Value;
+                if (val == "both") style.Alignment = Alignment.both;
+            }
+        }
+
+        return style;
+    }
+
+    private struct RunStyle
+    {
+        public string FontName;
+        public float? FontSize;
+        public string Color;
+        public bool Bold;
+        public bool Italic;
+        public bool Underline;
+    }
+
+    private RunStyle ExtractRunStyle(dynamic run)
+    {
+        var style = new RunStyle
+        {
+            FontName = run.FontFamily?.Name,
+            FontSize = (float?)run.FontSize,
+            Bold = run.Bold,
+            Italic = run.Italic,
+            Underline = run.UnderlineStyle != UnderlineStyle.none
+        };
+
+        var rPr = run.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "rPr");
+        if (rPr != null)
+        {
+            XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+            // Font
+            var rFonts = rPr.Element(w + "rFonts");
+            if (rFonts != null)
+            {
+                var font = rFonts.Attribute(w + "ascii")?.Value ?? rFonts.Attribute(w + "hAnsi")?.Value;
+                if (!string.IsNullOrEmpty(font)) style.FontName = font;
+            }
+
+            // Size
+            var sz = rPr.Element(w + "sz");
+            if (sz != null)
+            {
+                if (float.TryParse(sz.Attribute(w + "val")?.Value, out float halfPts))
+                    style.FontSize = halfPts / 2f;
+            }
+
+            // Color
+            var color = rPr.Element(w + "color");
+            if (color != null)
+            {
+                style.Color = color.Attribute(w + "val")?.Value;
+            }
+
+            // Styles
+            if (rPr.Element(w + "b") != null) style.Bold = true;
+            if (rPr.Element(w + "i") != null) style.Italic = true;
+            if (rPr.Element(w + "u") != null) style.Underline = true;
+        }
+
+        return style;
+    }
+
+    private void RenderParagraph(ColumnDescriptor column, Paragraph paragraph)
+    {
+        var style = ExtractParagraphStyle(paragraph);
+
+        var item = column.Item();
+
+        // Spacing
+        float paddingTop = style.SpacingBefore ?? 3;
+        float paddingBottom = style.SpacingAfter ?? 3;
+
+        // Ensure some minimum spacing if it likely needs it (headings etc) handled by caller or style?
+        // Let's trust the style for now.
+
+        item.PaddingTop(paddingTop)
+            .PaddingBottom(paddingBottom)
+            .PaddingLeft(style.LeftIndent)
+            .PaddingRight(style.RightIndent)
+            .Text(text =>
+            {
+                // Handle FirstLineIndent/Hanging if possible
+                // QuestPDF doesn't have an 'indent' property on text, so we might need a workaround for hanging.
+                // For now, focus on standard flow.
+                ProcessTextRuns(text, paragraph);
+                ApplyAlignment(text, style.Alignment);
+            });
     }
 
     private void ProcessImage(ColumnDescriptor column, DocX wordDocument, string imageId, float? width, float? height)
@@ -990,7 +1107,7 @@ public class WordToPdfService
          }
     }
 
-    private static void RenderImportantBox(ColumnDescriptor column, List<Paragraph> paragraphs)
+    private void RenderImportantBox(ColumnDescriptor column, List<Paragraph> paragraphs)
     {
         column.Item()
             .PaddingVertical(16)
@@ -1042,26 +1159,26 @@ public class WordToPdfService
             });
     }
 
-    private static void ProcessTextRunsForBox(TextDescriptor text, Paragraph paragraph)
+    private void ProcessTextRunsForBox(TextDescriptor text, Paragraph paragraph)
     {
         foreach (var run in paragraph.MagicText)
         {
             if (string.IsNullOrEmpty(run.text)) continue;
 
+            var style = ExtractRunStyle(run);
             var span = text.Span(run.text);
 
-            if (run.formatting?.Bold == true) span.Bold();
-            if (run.formatting?.Italic == true) span.Italic();
-            if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) span.Underline();
+            if (style.Bold) span.Bold();
+            if (style.Italic) span.Italic();
+            if (style.Underline) span.Underline();
 
-            if (run.formatting?.Size.HasValue == true)
-            {
-                span.FontSize((float)run.formatting.Size.Value);
-            }
+            if (style.FontSize.HasValue) span.FontSize(style.FontSize.Value);
+            if (!string.IsNullOrEmpty(style.FontName)) span.FontFamily(style.FontName);
+            if (!string.IsNullOrEmpty(style.Color)) span.FontColor("#" + style.Color);
         }
     }
 
-    private static void ApplyAlignment(TextDescriptor text, Alignment? alignment)
+    private void ApplyAlignment(TextDescriptor text, Alignment? alignment)
     {
         switch (alignment)
         {
@@ -1083,12 +1200,13 @@ public class WordToPdfService
         }
     }
 
-    private static void ProcessTextRuns(TextDescriptor text, Paragraph paragraph)
+    private void ProcessTextRuns(TextDescriptor text, Paragraph paragraph)
     {
         foreach (var run in paragraph.MagicText)
         {
             if (string.IsNullOrEmpty(run.text)) continue;
 
+            var style = ExtractRunStyle(run);
             var textParts = run.text.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
 
             for (int i = 0; i < textParts.Length; i++)
@@ -1111,12 +1229,12 @@ public class WordToPdfService
                             var linkSpan = text.Hyperlink(part, uriString);
                             linkSpan.FontColor(Colors.Blue.Darken1);
                             linkSpan.Underline();
-                            if (run.formatting?.Bold == true) linkSpan.Bold();
-                            if (run.formatting?.Italic == true) linkSpan.Italic();
-                            if (run.formatting?.Size.HasValue == true)
-                            {
-                                linkSpan.FontSize((float)run.formatting.Size.Value);
-                            }
+
+                            if (style.Bold) linkSpan.Bold();
+                            if (style.Italic) linkSpan.Italic();
+                            if (style.FontSize.HasValue) linkSpan.FontSize(style.FontSize.Value);
+                            if (!string.IsNullOrEmpty(style.FontName)) linkSpan.FontFamily(style.FontName);
+
                             continue;
                         }
                     }
@@ -1125,24 +1243,27 @@ public class WordToPdfService
 
                 var span = text.Span(part);
 
-                if (run.formatting?.Bold == true) span.Bold();
-                if (run.formatting?.Italic == true) span.Italic();
-                if (run.formatting?.UnderlineStyle == UnderlineStyle.singleLine) span.Underline();
+                if (style.Bold) span.Bold();
+                if (style.Italic) span.Italic();
+                if (style.Underline) span.Underline();
 
-                if (run.formatting?.FontFamily != null)
+                if (style.FontSize.HasValue)
                 {
-                    span.FontFamily(run.formatting.FontFamily.ToString());
+                    span.FontSize(style.FontSize.Value);
                 }
 
-                if (run.formatting?.FontColor.HasValue == true)
+                if (!string.IsNullOrEmpty(style.FontName))
                 {
-                    var color = run.formatting.FontColor.Value;
-                    span.FontColor(Color.FromARGB(color.A, color.R, color.G, color.B));
+                    span.FontFamily(style.FontName);
                 }
 
-                if (run.formatting?.Size.HasValue == true)
+                if (!string.IsNullOrEmpty(style.Color))
                 {
-                    span.FontSize((float)run.formatting.Size.Value);
+                    var hex = style.Color;
+                    if (hex.Length == 6 || hex.Length == 8)
+                    {
+                         span.FontColor("#" + hex);
+                    }
                 }
             }
         }
