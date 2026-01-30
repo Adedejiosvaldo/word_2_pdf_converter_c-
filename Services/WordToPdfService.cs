@@ -3,6 +3,8 @@ using Xceed.Words.NET;
 using Xceed.Document.NET;
 using QuestPDF.Helpers;
 using QuestPDF.Fluent;
+using System.IO.Compression;
+using System.Xml.Linq;
 
 namespace WordToPdf.Services;
 
@@ -83,8 +85,28 @@ public class WordToPdfService
                 Directory.CreateDirectory(outputDirectory);
             }
 
+            using var ms = new MemoryStream();
+            docxStream.CopyTo(ms);
+            ms.Position = 0;
+
+            // Sanitize the document to remove unsupported elements like altChunks
+            Console.WriteLine("Starting document sanitization...");
+            try
+            {
+                SanitizeDocument(ms);
+                ms.Position = 0;
+                Console.WriteLine("Document sanitization completed.");
+            }
+            catch (Exception ex)
+            {
+                // Log warning but attempt to proceed if sanitization fails
+                 Console.WriteLine($"Sanitization FAILED: {ex.Message}");
+                 Console.WriteLine(ex.StackTrace);
+                 ms.Position = 0;
+            }
+
             // Load document ONCE
-            using var wordDocument = DocX.Load(docxStream);
+            using var wordDocument = DocX.Load(ms);
 
             // Extract dynamic values (metadata) from the document
             ExtractDocumentMetadata(wordDocument, result);
@@ -191,12 +213,156 @@ public class WordToPdfService
                     var parts = text.Split(':', 2);
                     if (parts.Length == 2) result.PolicyNumber = parts[1].Trim();
                 }
+
             }
 
             if (!string.IsNullOrEmpty(result.InsuredName) && !string.IsNullOrEmpty(result.PolicyNumber))
                 break;
         }
     }
+
+    private void SanitizeDocument(Stream stream)
+    {
+        // We need to edit the zip archive.
+        // Important: We must keep the stream open and seekable.
+        using (var archive = new ZipArchive(stream, ZipArchiveMode.Update, true))
+        {
+            // 1. Identify altChunks to remove by looking at document.xml
+            var documentEntry = archive.GetEntry("word/document.xml");
+            var altChunkIds = new HashSet<string>();
+
+            if (documentEntry != null)
+            {
+                XDocument doc;
+                using (var entryStream = documentEntry.Open())
+                {
+                    doc = XDocument.Load(entryStream);
+                }
+
+                XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+                XNamespace r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+                var altChunkElements = doc.Descendants(w + "altChunk").ToList();
+
+                foreach (var ac in altChunkElements)
+                {
+                     var rId = ac.Attribute(r + "id")?.Value;
+                     if (!string.IsNullOrEmpty(rId))
+                     {
+                         altChunkIds.Add(rId);
+                     }
+                }
+
+                if (altChunkElements.Any())
+                {
+                    Console.WriteLine($"Found {altChunkElements.Count} altChunks in document.xml. Removing...");
+                    altChunkElements.Remove();
+
+                    using (var entryStream = documentEntry.Open())
+                    {
+                        entryStream.SetLength(0);
+                        doc.Save(entryStream);
+                    }
+                }
+            }
+
+            // 2. Remove relationships and catch targets
+            var targetsToRemove = new HashSet<string>();
+            var relsEntry = archive.GetEntry("word/_rels/document.xml.rels");
+            if (relsEntry != null)
+            {
+                XDocument relsDoc;
+                using (var entryStream = relsEntry.Open())
+                {
+                    relsDoc = XDocument.Load(entryStream);
+                }
+
+                XNamespace rel = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+                // Find relationships that match our altChunk Ids OR have the aFChunk type
+                var badRels = relsDoc.Descendants(rel + "Relationship")
+                    .Where(r =>
+                        (r.Attribute("Id")?.Value != null && altChunkIds.Contains(r.Attribute("Id")!.Value)) ||
+                        r.Attribute("Type")?.Value.Contains("aFChunk") == true
+                     )
+                    .ToList();
+
+                foreach (var br in badRels)
+                {
+                    var target = br.Attribute("Target")?.Value;
+                    if (!string.IsNullOrEmpty(target))
+                    {
+                        // Targets are usually relative, e.g., "afchunk2.docx" or "/word/afchunk2.docx"
+                        // We need to normalize to find the zip entry.
+                        // Assuming they are in 'word/' folder if they don't start with /
+                        targetsToRemove.Add(target);
+                    }
+                }
+
+                if (badRels.Any())
+                {
+                    Console.WriteLine($"Removing {badRels.Count} relationships.");
+                    badRels.Remove();
+
+                    using (var entryStream = relsEntry.Open())
+                    {
+                        entryStream.SetLength(0);
+                        relsDoc.Save(entryStream);
+                    }
+                }
+            }
+
+            // 3. Delete the actual chunk files from the archive
+            foreach (var target in targetsToRemove)
+            {
+                 // Handle path variations
+                 string entryName = target.TrimStart('/');
+                 if (!entryName.StartsWith("word/") && !entryName.Contains("/"))
+                 {
+                     entryName = "word/" + entryName;
+                 }
+
+                 var chunkEntry = archive.GetEntry(entryName);
+                 if (chunkEntry != null)
+                 {
+                     Console.WriteLine($"Deleting entry: {entryName}");
+                     chunkEntry.Delete();
+                 }
+            }
+
+            // 4. Remove from [Content_Types].xml
+            var contentTypesEntry = archive.GetEntry("[Content_Types].xml");
+            if (contentTypesEntry != null)
+            {
+                XDocument contentTypesDoc;
+                using (var entryStream = contentTypesEntry.Open())
+                {
+                    contentTypesDoc = XDocument.Load(entryStream);
+                }
+
+                XNamespace ns = "http://schemas.openxmlformats.org/package/2006/content-types";
+                var badTypes = contentTypesDoc.Descendants(ns + "Override")
+                    .Where(t => t.Attribute("PartName")?.Value.Contains("afchunk") == true)
+                    .ToList();
+
+                 badTypes.AddRange(contentTypesDoc.Descendants(ns + "Default")
+                    .Where(t => t.Attribute("Extension")?.Value.Contains("afchunk") == true));
+
+                if (badTypes.Any())
+                {
+                     Console.WriteLine($"Removing {badTypes.Count} content types.");
+                     badTypes.Remove();
+                     using (var entryStream = contentTypesEntry.Open())
+                     {
+                         entryStream.SetLength(0);
+                         contentTypesDoc.Save(entryStream);
+                     }
+                }
+            }
+        }
+    }
+
+
 
     private void RenderContent(ColumnDescriptor column, DocX wordDocument, HashSet<Paragraph> paragraphsInTables, List<Table> allTables)
     {
