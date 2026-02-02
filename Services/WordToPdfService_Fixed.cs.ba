@@ -6,6 +6,10 @@ using QuestPDF.Fluent;
 using System.IO.Compression;
 using System.Xml.Linq;
 
+POLICY NO: XXX should be at the right of the header, not the left
+THe footer doesnt show the name of the insured
+3. The image that represents the  autorized signature is not centeralized. it is going to the right.
+
 namespace WordToPdf.Services;
 
 /// <summary>
@@ -16,7 +20,7 @@ public class WordToPdfService
 {
     private const float TWIPS_TO_POINTS = 1f / 20f;
     private const float EMUS_TO_POINTS = 1f / 12700f;
-    
+
     // Sections that must start on new pages
     private static readonly string[] NewPageSections = {
         "POLICY SCHEDULE",
@@ -231,7 +235,7 @@ public class WordToPdfService
                                     }
                                 }
                             });
-                            
+
                             // Right side: Policy number - only if not already in header
                             row.RelativeItem().AlignRight().Text(text =>
                             {
@@ -305,16 +309,16 @@ public class WordToPdfService
 
         // Remove common duplicates and clean up
         var cleaned = footerText;
-        
+
         // Remove page numbers that might be embedded
         cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"\b\d+\b", "").Trim();
-        
+
         // Remove insured name if it appears
         cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"VINCINTORE DENTAL CLINIC LIMITED", "", StringComparison.OrdinalIgnoreCase).Trim();
-        
+
         // Remove "Authorised and regulated" text
         cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"Authorised and regulated.*", "", StringComparison.OrdinalIgnoreCase).Trim();
-        
+
         // If nothing left, use default
         if (string.IsNullOrWhiteSpace(cleaned))
         {
@@ -333,8 +337,8 @@ public class WordToPdfService
 
         // Remove duplicate "POLICY NO:" patterns
         var cleaned = System.Text.RegularExpressions.Regex.Replace(
-            text, 
-            @"POLICY NO:\s*[^\s]+\s*POLICY NO:\s*[^\s]+", 
+            text,
+            @"POLICY NO:\s*[^\s]+\s*POLICY NO:\s*[^\s]+",
             match =>
             {
                 // Keep only the first occurrence
@@ -695,7 +699,7 @@ public class WordToPdfService
                 float fontSize = 14;
                 float paddingTop = GetParagraphSpacingBefore(paragraph);
                 float paddingBottom = GetParagraphSpacingAfter(paragraph);
-                
+
                 // FIXED: Better default spacing for headings
                 if (paddingTop <= 0) paddingTop = 12;
                 if (paddingBottom <= 0) paddingBottom = 8;
@@ -1454,13 +1458,13 @@ public class WordToPdfService
                     QuestPDF.Infrastructure.IContainer container = cellElement;
 
                     // Apply borders - FIXED: Only apply if border size > 0
-                    if (style.TopBorderSize > 0) 
+                    if (style.TopBorderSize > 0)
                         container = container.BorderTop(style.TopBorderSize).BorderColor("#" + style.TopBorderColor);
-                    if (style.BottomBorderSize > 0) 
+                    if (style.BottomBorderSize > 0)
                         container = container.BorderBottom(style.BottomBorderSize).BorderColor("#" + style.BottomBorderColor);
-                    if (style.LeftBorderSize > 0) 
+                    if (style.LeftBorderSize > 0)
                         container = container.BorderLeft(style.LeftBorderSize).BorderColor("#" + style.LeftBorderColor);
-                    if (style.RightBorderSize > 0) 
+                    if (style.RightBorderSize > 0)
                         container = container.BorderRight(style.RightBorderSize).BorderColor("#" + style.RightBorderColor);
 
                     // FIXED: Better cell padding
@@ -1476,7 +1480,7 @@ public class WordToPdfService
                             foreach (var cellParagraph in cell.Paragraphs)
                             {
                                 var cellText = cellParagraph.Text?.Trim() ?? "";
-                                
+
                                 // Skip completely empty paragraphs in tables
                                 if (string.IsNullOrWhiteSpace(cellText))
                                 {
@@ -1518,11 +1522,11 @@ public class WordToPdfService
     {
         size = 0;
         color = "000000";
-        
+
         if (border == null) return;
 
         XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-        
+
         var sz = border.Attribute(w + "sz")?.Value;
         if (float.TryParse(sz, out float szVal))
         {
@@ -1573,9 +1577,9 @@ public class WordToPdfService
                      .PaddingVertical(10)
                      .AlignCenter();
 
-                 if (width.HasValue && width.Value > 0) 
+                 if (width.HasValue && width.Value > 0)
                      imgContainer = imgContainer.MaxWidth(Math.Min(width.Value, 400));
-                 else 
+                 else
                      imgContainer = imgContainer.MaxWidth(200);
 
                  imgContainer.Image(imageBytes);
@@ -1653,7 +1657,7 @@ public class WordToPdfService
 
             if (style.FontSize.HasValue) span.FontSize(style.FontSize.Value);
             else span.FontSize(11);
-            
+
             if (!string.IsNullOrEmpty(style.FontName)) span.FontFamily(style.FontName);
             if (!string.IsNullOrEmpty(style.Color)) span.FontColor("#" + style.Color);
         }

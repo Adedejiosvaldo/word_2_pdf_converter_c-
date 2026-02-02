@@ -67,6 +67,12 @@ public class WordToPdfService
         "FIRE INSURANCE"
     };
 
+    // Symbol/Wingdings fonts that should fall back to standard bullets
+    private static readonly HashSet<string> SymbolFonts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Wingdings", "Wingdings 2", "Wingdings 3", "Symbol", "Webdings", "ZapfDingbats"
+    };
+
     // ISSUE 2: Track if we've rendered the first insurance type heading
     private bool _hasRenderedFirstInsuranceType = false;
 
@@ -226,17 +232,19 @@ public class WordToPdfService
                         .Text(_headerFooterContent.GetValueOrDefault(_sectionProps.FirstPageHeaderId ?? "", ""))
                         .FontSize(9).AlignRight();
 
-                    // Default Header (Page 2+) - FIXED: Only show if not first page with titlePg
+                    // Default Header (Page 2+)
                     headerCol.Item().ShowIf(ctx => ctx.PageNumber > 1 || (!_sectionProps.TitlePg && !string.IsNullOrEmpty(_sectionProps.HeaderId)))
-                        .Row(row =>
+                        .PaddingBottom(6).Row(row =>
                         {
-                            // Left side: Header content
+                            // Left side: Header content (stripped of policy number to avoid duplication)
                             row.RelativeItem().Text(text =>
                             {
                                 if (_sectionProps.HeaderId != null && _headerFooterContent.TryGetValue(_sectionProps.HeaderId, out var hText))
                                 {
-                                    // FIXED: Clean header text - remove duplicate policy numbers
                                     var cleanHeader = CleanHeaderFooterText(hText);
+                                    // Strip policy number from header text so it only appears on the right
+                                    cleanHeader = System.Text.RegularExpressions.Regex.Replace(
+                                        cleanHeader ?? "", @"POLICY\s*NO[:\s]*\S+", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
                                     if (!string.IsNullOrEmpty(cleanHeader))
                                     {
                                         text.Span(cleanHeader).FontSize(9);
@@ -244,12 +252,10 @@ public class WordToPdfService
                                 }
                             });
 
-                            // Right side: Policy number - only if not already in header
+                            // Right side: Policy number (always on the right)
                             row.RelativeItem().AlignRight().Text(text =>
                             {
-                                // Only show if header doesn't already contain policy number
-                                var headerText = _headerFooterContent.GetValueOrDefault(_sectionProps.HeaderId ?? "", "");
-                                if (!headerText.Contains(metadata.PolicyNumber))
+                                if (!string.IsNullOrEmpty(metadata.PolicyNumber))
                                 {
                                     text.Span($"POLICY NO: {metadata.PolicyNumber}").FontSize(9);
                                 }
@@ -285,11 +291,14 @@ public class WordToPdfService
                         });
 
                         // Right: Insured name (40% width)
-                        row.RelativeItem(4).AlignRight().Text(metadata.InsuredName).FontSize(8);
+                        row.RelativeItem(4).AlignRight().Text(text =>
+                        {
+                            text.Span(metadata.InsuredName ?? "").FontSize(8);
+                        });
                     });
 
                     // Bottom: Regulatory text
-                    footerColumn.Item().PaddingTop(4).AlignCenter()
+                    footerColumn.Item().PaddingTop(6).AlignCenter()
                         .Text("Authorised and regulated by the National Insurance Commission [RIC-048]")
                         .FontSize(7);
                 });
@@ -361,6 +370,7 @@ public class WordToPdfService
 
     private void ExtractDocumentMetadata(DocX wordDocument, ConversionResult result)
     {
+        // First try paragraphs (works when label and value are in the same paragraph)
         foreach (var p in wordDocument.Paragraphs)
         {
             var text = p.Text?.Trim() ?? string.Empty;
@@ -369,7 +379,8 @@ public class WordToPdfService
             if (string.IsNullOrEmpty(result.InsuredName) && text.StartsWith("INSURED:", StringComparison.OrdinalIgnoreCase))
             {
                 var parts = text.Split(':', 2);
-                if (parts.Length == 2) result.InsuredName = parts[1].Trim();
+                if (parts.Length == 2 && !string.IsNullOrWhiteSpace(parts[1]))
+                    result.InsuredName = parts[1].Trim();
             }
 
             if (string.IsNullOrEmpty(result.PolicyNumber))
@@ -378,12 +389,53 @@ public class WordToPdfService
                     text.StartsWith("POLICY NUMBER:", StringComparison.OrdinalIgnoreCase))
                 {
                     var parts = text.Split(':', 2);
-                    if (parts.Length == 2) result.PolicyNumber = parts[1].Trim();
+                    if (parts.Length == 2 && !string.IsNullOrWhiteSpace(parts[1]))
+                        result.PolicyNumber = parts[1].Trim();
                 }
             }
 
             if (!string.IsNullOrEmpty(result.InsuredName) && !string.IsNullOrEmpty(result.PolicyNumber))
                 break;
+        }
+
+        // If still missing, search table rows (label and value may be in adjacent cells)
+        if (string.IsNullOrEmpty(result.InsuredName) || string.IsNullOrEmpty(result.PolicyNumber))
+        {
+            foreach (var table in wordDocument.Tables)
+            {
+                foreach (var row in table.Rows)
+                {
+                    for (int i = 0; i < row.Cells.Count - 1; i++)
+                    {
+                        var cellText = string.Join(" ", row.Cells[i].Paragraphs.Select(p => p.Text?.Trim() ?? "")).Trim();
+                        var nextCellText = string.Join(" ", row.Cells[i + 1].Paragraphs.Select(p => p.Text?.Trim() ?? "")).Trim();
+
+                        if (string.IsNullOrEmpty(result.InsuredName) &&
+                            (cellText.Equals("INSURED:", StringComparison.OrdinalIgnoreCase) ||
+                             cellText.Equals("INSURED", StringComparison.OrdinalIgnoreCase) ||
+                             cellText.Equals("INSURED :", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            if (!string.IsNullOrWhiteSpace(nextCellText))
+                                result.InsuredName = nextCellText.Trim();
+                        }
+
+                        if (string.IsNullOrEmpty(result.PolicyNumber) &&
+                            (cellText.StartsWith("POLICY NO", StringComparison.OrdinalIgnoreCase) ||
+                             cellText.StartsWith("POLICY NUMBER", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            // Value might be after colon in same cell or in next cell
+                            var parts = cellText.Split(':', 2);
+                            if (parts.Length == 2 && !string.IsNullOrWhiteSpace(parts[1]))
+                                result.PolicyNumber = parts[1].Trim();
+                            else if (!string.IsNullOrWhiteSpace(nextCellText))
+                                result.PolicyNumber = nextCellText.Trim();
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(result.InsuredName) && !string.IsNullOrEmpty(result.PolicyNumber))
+                    break;
+            }
         }
     }
 
@@ -536,7 +588,6 @@ public class WordToPdfService
 
         XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 
-        // CRITICAL FIX: Process elements in document order
         // Xceed.Words.NET's wordDocument.Xml IS the body element directly
         XElement? bodyXml = null;
 
@@ -673,6 +724,24 @@ public class WordToPdfService
             }
             if (string.IsNullOrWhiteSpace(paragraph.Text?.Replace("\f", "").Replace("\x0C", "")))
                 return;
+        }
+
+        // Check for XML-based page breaks (w:pageBreakBefore or w:br type="page")
+        {
+            XNamespace wpb = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+            var pPr = paragraph.Xml?.Element(wpb + "pPr");
+            bool hasPageBreakBefore = pPr?.Element(wpb + "pageBreakBefore") != null;
+            bool hasRunPageBreak = paragraph.Xml?.Descendants(wpb + "br")
+                .Any(br => br.Attribute(wpb + "type")?.Value == "page") == true;
+
+            if (hasPageBreakBefore || hasRunPageBreak)
+            {
+                if (_hasContentSincePageBreak)
+                {
+                    column.Item().PageBreak();
+                    _hasContentSincePageBreak = false;
+                }
+            }
         }
 
         // Images
@@ -848,15 +917,20 @@ public class WordToPdfService
                 paddingBottom = 8;
             }
 
-            // ISSUE 7: Track if entering policy conditions section
+            // ISSUE 7: Track if entering/leaving policy conditions section
             if (paragraphText.StartsWith("POLICY CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
                 paragraphText.StartsWith("CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
                 paragraphText.StartsWith("EXCEPTIONS", StringComparison.OrdinalIgnoreCase))
             {
                 _inPolicyConditions = true;
             }
+            else
+            {
+                // Reset when a different heading section is encountered
+                _inPolicyConditions = false;
+            }
 
-            column.Item().PaddingTop(paddingTop).PaddingBottom(paddingBottom).Text(text =>
+            column.Item().EnsureSpace(60).PaddingTop(paddingTop).PaddingBottom(paddingBottom).Text(text =>
             {
                 text.Span(paragraphText).Bold().FontSize(fontSize);
                 ApplyAlignment(text, alignment);
@@ -876,7 +950,7 @@ public class WordToPdfService
 
         if (isBoldShort && !paragraph.IsListItem && !IsAllCaps(paragraphText))
         {
-            column.Item().PaddingTop(8).PaddingBottom(4).Text(text =>
+            column.Item().EnsureSpace(60).PaddingTop(8).PaddingBottom(4).Text(text =>
             {
                 ProcessTextRuns(text, paragraph);
                 ApplyAlignment(text, paragraph.Alignment);
@@ -967,7 +1041,11 @@ public class WordToPdfService
         foreach (var heading in ValidHeadings)
         {
             if (text.StartsWith(heading, StringComparison.OrdinalIgnoreCase))
-                return true;
+            {
+                // Only treat as heading if the text is short (a real heading, not a long paragraph that starts with these words)
+                if (text.Length <= heading.Length + 20)
+                    return true;
+            }
         }
 
         bool isAllCaps = IsAllCaps(text);
@@ -1535,7 +1613,11 @@ public class WordToPdfService
         {
             if (text == "o") return "○";
             if (text == "·") return "•";
-            return text.Length > 0 ? text[0].ToString() : "•";
+            if (text == "§") return "▪";
+            // Characters in Unicode private use area are from symbol fonts - use standard bullet
+            if (text.Length > 0 && text[0] >= 0xF000) return "•";
+            if (string.IsNullOrEmpty(text)) return "•";
+            return "•";
         }
 
         string value = counter.ToString();
@@ -1572,28 +1654,106 @@ public class WordToPdfService
     }
 
     /// <summary>
-    /// FIXED: Improved table rendering with better handling of empty cells and borders
-    /// Also detects tables that should be borderless (INSURED/POLICY info, Prepared by)
+    /// Pre-compute row spans for vertical merges so QuestPDF can render them correctly.
+    /// Returns a dictionary mapping (rowIndex, gridCol) to the number of rows spanned.
+    /// </summary>
+    private Dictionary<(int row, int col), int> ComputeVerticalMergeSpans(Table table, int totalGridColumns)
+    {
+        var spans = new Dictionary<(int, int), int>();
+        var occupancy = new bool[table.Rows.Count + 1, totalGridColumns + 1];
+        var restartRow = new Dictionary<int, int>(); // gridCol (1-based) -> starting row (0-based)
+
+        for (int rowIndex = 0; rowIndex < table.Rows.Count; rowIndex++)
+        {
+            int gridCol = 1;
+            for (int cellIndex = 0; cellIndex < table.Rows[rowIndex].Cells.Count; cellIndex++)
+            {
+                while (gridCol <= totalGridColumns && occupancy[rowIndex + 1, gridCol])
+                    gridCol++;
+                if (gridCol > totalGridColumns) break;
+
+                var style = ExtractCellStyle(table.Rows[rowIndex].Cells[cellIndex]);
+
+                for (int s = 0; s < style.GridSpan; s++)
+                {
+                    if (gridCol + s <= totalGridColumns)
+                        occupancy[rowIndex + 1, gridCol + s] = true;
+                }
+
+                if (style.IsVerticalMergeRestart)
+                {
+                    restartRow[gridCol] = rowIndex;
+                    spans[(rowIndex, gridCol)] = 1;
+                }
+                else if (style.IsVerticalMergeContinue)
+                {
+                    if (restartRow.TryGetValue(gridCol, out int startRow))
+                    {
+                        spans[(startRow, gridCol)]++;
+                    }
+                }
+                else
+                {
+                    restartRow.Remove(gridCol);
+                }
+
+                gridCol += style.GridSpan;
+            }
+        }
+
+        return spans;
+    }
+
+    /// <summary>
+    /// FIXED: Improved table rendering with gridCol widths, vertical merge RowSpan,
+    /// better handling of empty cells, and borderless table detection.
     /// </summary>
     private void RenderTable(ColumnDescriptor parentColumn, Table table)
     {
         if (table.Rows.Count == 0) return;
 
-        // Calculate total columns
-        int totalGridColumns = table.Rows[0].Cells.Sum(c => ExtractCellStyle(c).GridSpan);
+        XNamespace wt = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+        // Read grid column widths from table XML for proportional sizing
+        var gridColWidths = new List<float>();
+        var tblGrid = table.Xml?.Element(wt + "tblGrid");
+        if (tblGrid != null)
+        {
+            foreach (var gc in tblGrid.Elements(wt + "gridCol"))
+            {
+                if (float.TryParse(gc.Attribute(wt + "w")?.Value, out float cw))
+                    gridColWidths.Add(cw);
+                else
+                    gridColWidths.Add(1f);
+            }
+        }
+
+        // Calculate total columns - prefer gridCol count, fallback to first row
+        int totalGridColumns = gridColWidths.Count > 0
+            ? gridColWidths.Count
+            : table.Rows[0].Cells.Sum(c => ExtractCellStyle(c).GridSpan);
         if (totalGridColumns <= 0) return;
 
-        // ISSUE 1 FIX: Detect tables that should be borderless
+        // Detect tables that should be borderless
         bool isBorderlessTable = ShouldTableBeBorderless(table);
+
+        // Pre-compute vertical merge spans
+        var vMergeSpans = ComputeVerticalMergeSpans(table, totalGridColumns);
 
         parentColumn.Item().Table(tableElement =>
         {
-            // Set up columns
+            // Set up columns with actual widths from Word XML
             tableElement.ColumnsDefinition(columns =>
             {
-                for (int i = 0; i < totalGridColumns; i++)
+                if (gridColWidths.Count == totalGridColumns)
                 {
-                    columns.RelativeColumn();
+                    foreach (var cw in gridColWidths)
+                        columns.RelativeColumn(Math.Max(cw, 1f));
+                }
+                else
+                {
+                    for (int i = 0; i < totalGridColumns; i++)
+                        columns.RelativeColumn();
                 }
             });
 
@@ -1617,7 +1777,7 @@ public class WordToPdfService
                     }
                     if (currentGridCol > totalGridColumns) break;
 
-                    // Skip continued vertical merges
+                    // Skip continued vertical merges (content comes from the restart cell)
                     if (style.IsVerticalMergeContinue)
                     {
                         for (int i = 0; i < style.GridSpan; i++)
@@ -1636,15 +1796,23 @@ public class WordToPdfService
                             occupancy[rowIndex + 1, currentGridCol + i] = true;
                     }
 
-                    // Render cell
+                    // Render cell with position and span
                     var cellElement = tableElement.Cell()
                         .Row((uint)(rowIndex + 1))
                         .Column((uint)currentGridCol)
                         .ColumnSpan((uint)style.GridSpan);
 
+                    // Apply RowSpan for vertical merges
+                    if (style.IsVerticalMergeRestart &&
+                        vMergeSpans.TryGetValue((rowIndex, currentGridCol), out int rowSpan) &&
+                        rowSpan > 1)
+                    {
+                        cellElement = cellElement.RowSpan((uint)rowSpan);
+                    }
+
                     QuestPDF.Infrastructure.IContainer container = cellElement;
 
-                    // Apply borders - FIXED: Skip borders for borderless tables
+                    // Apply borders - skip for borderless tables
                     if (!isBorderlessTable)
                     {
                         if (style.TopBorderSize > 0)
@@ -1657,13 +1825,11 @@ public class WordToPdfService
                             container = container.BorderRight(style.RightBorderSize).BorderColor("#" + style.RightBorderColor);
                     }
 
-                    // FIXED: Better cell padding
                     container.Padding(6).Column(cellColumn =>
                     {
-                        // FIXED: Handle empty cells gracefully
                         if (cell.Paragraphs.Count == 0)
                         {
-                            cellColumn.Item().Text(" "); // Non-breaking space for empty cells
+                            cellColumn.Item().Text(" ");
                         }
                         else
                         {
@@ -1671,14 +1837,12 @@ public class WordToPdfService
                             {
                                 var cellText = cellParagraph.Text?.Trim() ?? "";
 
-                                // Skip completely empty paragraphs in tables
                                 if (string.IsNullOrWhiteSpace(cellText))
                                 {
-                                    cellColumn.Item().Height(4); // Minimal spacing
+                                    cellColumn.Item().Height(4);
                                     continue;
                                 }
 
-                                // Check if it's a header-style cell (bold, short)
                                 bool isBold = cellParagraph.MagicText.Any(r => r.formatting?.Bold == true);
                                 bool isShort = cellText.Length < 40;
 
@@ -1804,8 +1968,8 @@ public class WordToPdfService
 
                  if (isSignatureImage)
                  {
-                     // Signature image: smaller and right-aligned
-                     imgContainer = imgContainer.AlignRight();
+                     // Signature image: smaller and centered
+                     imgContainer = imgContainer.AlignCenter();
                      imgContainer = imgContainer.MaxWidth(80).MaxHeight(80);
                  }
                  else
@@ -1894,7 +2058,7 @@ public class WordToPdfService
             if (style.FontSize.HasValue) span.FontSize(style.FontSize.Value);
             else span.FontSize(11);
 
-            if (!string.IsNullOrEmpty(style.FontName)) span.FontFamily(style.FontName);
+            if (!string.IsNullOrEmpty(style.FontName) && !SymbolFonts.Contains(style.FontName)) span.FontFamily(style.FontName);
             if (!string.IsNullOrEmpty(style.Color)) span.FontColor("#" + style.Color);
         }
     }
@@ -1954,7 +2118,7 @@ public class WordToPdfService
                             if (style.Bold) linkSpan.Bold();
                             if (style.Italic) linkSpan.Italic();
                             if (style.FontSize.HasValue) linkSpan.FontSize(style.FontSize.Value);
-                            if (!string.IsNullOrEmpty(style.FontName)) linkSpan.FontFamily(style.FontName);
+                            if (!string.IsNullOrEmpty(style.FontName) && !SymbolFonts.Contains(style.FontName)) linkSpan.FontFamily(style.FontName);
 
                             continue;
                         }
@@ -1973,7 +2137,7 @@ public class WordToPdfService
                     span.FontSize(style.FontSize.Value);
                 }
 
-                if (!string.IsNullOrEmpty(style.FontName))
+                if (!string.IsNullOrEmpty(style.FontName) && !SymbolFonts.Contains(style.FontName))
                 {
                     span.FontFamily(style.FontName);
                 }
