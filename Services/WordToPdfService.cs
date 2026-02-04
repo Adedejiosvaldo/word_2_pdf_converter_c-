@@ -1,2169 +1,297 @@
-using QuestPDF.Infrastructure;
-using Xceed.Words.NET;
-using Xceed.Document.NET;
-using QuestPDF.Helpers;
-using QuestPDF.Fluent;
-using System.IO.Compression;
-using System.Xml.Linq;
+using System.Diagnostics;
 
 namespace WordToPdf.Services;
 
 /// <summary>
-/// Service that converts Word documents to PDF using QuestPDF
-/// FIXED VERSION - Addresses header duplication, footer formatting, table rendering, and spacing issues
+/// Service that converts Word documents to PDF using LibreOffice headless
 /// </summary>
 public class WordToPdfService
 {
-    private const float TWIPS_TO_POINTS = 1f / 20f;
-    private const float EMUS_TO_POINTS = 1f / 12700f;
+    private readonly string _libreOfficePath;
+    private readonly ILogger<WordToPdfService> _logger;
+    private static readonly SemaphoreSlim _semaphore = new(4); // Limit concurrent conversions
 
-    // Sections that must start on new pages
-    private static readonly string[] NewPageSections = {
-        "POLICY SCHEDULE",
-        "MEMORANDA ATTACHING TO AND FORMING PART OF",
-        "THE SCHEDULE"  // Added this as it should be on a new page
-    };
-
-    // Text patterns that are NOT headings
-    private static readonly string[] ExcludePatterns = {
-        "IT IS AGREED",
-        "PROVIDED THAT",
-        "PROVIDED ALSO",
-        "WHEREAS",
-        "NOW THEREFORE",
-        "IN WITNESS",
-        "OZUMBA MBADIWE",
-        "VICTORIA ISLAND",
-        "LAGOS",
-        "Followed by",
-        "13TH",
-        "14TH",
-        "CIVIC TOWERS"
-    };
-
-    // Valid section headings
-    private static readonly string[] ValidHeadings = {
-        "PRODUCT LIABILITY INSURANCE",
-        "HEALTHCARE PROFESSIONAL INDEMNITY",
-        "IMPORTANT",
-        "PLEASE NOTE",
-        "EXCEPTIONS",
-        "CONDITIONS",
-        "POLICY CONDITIONS",
-        "THE SCHEDULE",
-        "MEMO ",
-        "MEMORANDUM",
-        "CLAIMS COMPLAINT",
-        "Important Notice"
-    };
-
-    // Insurance type headings (centered)
-    private static readonly string[] InsuranceTypes = {
-        "PRODUCT LIABILITY INSURANCE",
-        "HEALTHCARE PROFESSIONAL INDEMNITY INSURANCE",
-        "PROFESSIONAL INDEMNITY INSURANCE",
-        "PUBLIC LIABILITY INSURANCE",
-        "MOTOR INSURANCE",
-        "FIRE INSURANCE"
-    };
-
-    // Symbol/Wingdings fonts that should fall back to standard bullets
-    private static readonly HashSet<string> SymbolFonts = new(StringComparer.OrdinalIgnoreCase)
+    public WordToPdfService(ILogger<WordToPdfService> logger)
     {
-        "Wingdings", "Wingdings 2", "Wingdings 3", "Symbol", "Webdings", "ZapfDingbats"
-    };
-
-    // ISSUE 2: Track if we've rendered the first insurance type heading
-    private bool _hasRenderedFirstInsuranceType = false;
-
-    // ISSUE 5: Track if content has been rendered since last page break
-    private bool _hasContentSincePageBreak = true;
-
-    // ISSUE 6: Track image count for signature sizing
-    private int _imageCount = 0;
-
-    // ISSUE 7: Track if we're in policy conditions section for spacing
-    private bool _inPolicyConditions = false;
-
-    public WordToPdfService()
-    {
-        QuestPDF.Settings.License = LicenseType.Community;
+        _logger = logger;
+        _libreOfficePath = FindLibreOffice();
+        _logger.LogInformation("LibreOffice path: {Path}", _libreOfficePath);
     }
 
     /// <summary>
-    /// Convert a Word document stream to PDF and save to the specified directory
+    /// Convert a Word document stream to PDF and save to disk
     /// </summary>
-    public ConversionResult ConvertToPdf(Stream docxStream, string outputDirectory, string originalFileName)
+    public ConversionResult ConvertToPdf(Stream inputStream, string outputDirectory, string originalFileName)
     {
-        var result = new ConversionResult();
+        var tempDir = Path.Combine(Path.GetTempPath(), $"word2pdf_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
         try
         {
-            if (!Directory.Exists(outputDirectory))
+            // Save input stream to temp file
+            var safeFileName = SanitizeFileName(originalFileName);
+            var tempDocx = Path.Combine(tempDir, $"{safeFileName}.docx");
+            using (var fileStream = new FileStream(tempDocx, FileMode.Create))
             {
-                Directory.CreateDirectory(outputDirectory);
+                inputStream.CopyTo(fileStream);
             }
 
-            var (pdfDocument, metadata, docxMs) = GenerateDocumentModel(docxStream);
-
-            using (docxMs)
+            // Convert using LibreOffice
+            var (success, error) = RunLibreOffice(tempDocx, tempDir);
+            if (!success)
             {
-                result.InsuredName = metadata.InsuredName;
-                result.PolicyNumber = metadata.PolicyNumber;
-
-                // Generate filename
-                var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                var sanitizedPolicyNumber = string.IsNullOrEmpty(result.PolicyNumber)
-                    ? "NOPOLICY"
-                    : string.Join("_", result.PolicyNumber.Split(Path.GetInvalidFileNameChars()));
-
-                var generatedFileName = $"{originalFileName}_{sanitizedPolicyNumber}_{timestamp}.pdf";
-                var outputPath = Path.Combine(outputDirectory, generatedFileName);
-
-                pdfDocument.GeneratePdf(outputPath);
-
-                result.Success = true;
-                result.PdfPath = Path.GetFullPath(outputPath);
-                result.Message = "PDF created successfully";
+                return new ConversionResult
+                {
+                    Success = false,
+                    Message = $"LibreOffice conversion failed: {error}",
+                    Error = error
+                };
             }
+
+            // Find the generated PDF
+            var tempPdf = Path.Combine(tempDir, $"{safeFileName}.pdf");
+            if (!File.Exists(tempPdf))
+            {
+                return new ConversionResult
+                {
+                    Success = false,
+                    Message = "Conversion produced no output PDF"
+                };
+            }
+
+            // Move to output directory
+            var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            var pdfFileName = $"{originalFileName}_{timestamp}.pdf";
+            var pdfPath = Path.Combine(outputDirectory, pdfFileName);
+            File.Copy(tempPdf, pdfPath, overwrite: true);
+
+            return new ConversionResult
+            {
+                Success = true,
+                Message = "Conversion successful",
+                PdfPath = pdfPath,
+                FileName = pdfFileName
+            };
         }
         catch (Exception ex)
         {
-            result.Success = false;
-            result.Message = $"Conversion failed: {ex.Message}";
-            result.Error = ex.ToString();
+            return new ConversionResult
+            {
+                Success = false,
+                Message = $"Conversion failed: {ex.Message}",
+                Error = ex.ToString()
+            };
         }
-        return result;
+        finally
+        {
+            // Cleanup temp directory
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
     }
 
     /// <summary>
-    /// Convert a Word document stream to PDF and return the PDF file stream
+    /// Convert a Word document stream to PDF and return as a stream (for download)
     /// </summary>
-    public (ConversionResult Result, MemoryStream PdfStream) ConvertToPdfStream(Stream docxStream, string originalFileName)
+    public (ConversionResult result, MemoryStream? pdfStream) ConvertToPdfStream(Stream inputStream, string originalFileName)
     {
-        var result = new ConversionResult();
-        MemoryStream pdfStream = new MemoryStream();
+        var tempDir = Path.Combine(Path.GetTempPath(), $"word2pdf_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
 
         try
         {
-             var (pdfDocument, metadata, docxMs) = GenerateDocumentModel(docxStream);
-             using (docxMs)
-             {
-                 result.InsuredName = metadata.InsuredName;
-                 result.PolicyNumber = metadata.PolicyNumber;
+            // Save input stream to temp file
+            var safeFileName = SanitizeFileName(originalFileName);
+            var tempDocx = Path.Combine(tempDir, $"{safeFileName}.docx");
+            using (var fileStream = new FileStream(tempDocx, FileMode.Create))
+            {
+                inputStream.CopyTo(fileStream);
+            }
 
-                 pdfDocument.GeneratePdf(pdfStream);
-                 pdfStream.Position = 0;
+            // Convert using LibreOffice
+            var (success, error) = RunLibreOffice(tempDocx, tempDir);
+            if (!success)
+            {
+                var failResult = new ConversionResult
+                {
+                    Success = false,
+                    Message = $"LibreOffice conversion failed: {error}",
+                    Error = error
+                };
+                return (failResult, null);
+            }
 
-                 result.Success = true;
-                 result.Message = "PDF generated in memory";
-                 result.PdfPath = "MEMORY_STREAM";
-             }
+            // Find the generated PDF
+            var tempPdf = Path.Combine(tempDir, $"{safeFileName}.pdf");
+            if (!File.Exists(tempPdf))
+            {
+                var failResult = new ConversionResult
+                {
+                    Success = false,
+                    Message = "Conversion produced no output PDF"
+                };
+                return (failResult, null);
+            }
+
+            // Read into memory stream
+            var outputStream = new MemoryStream();
+            using (var fs = new FileStream(tempPdf, FileMode.Open, FileAccess.Read))
+            {
+                fs.CopyTo(outputStream);
+            }
+            outputStream.Position = 0;
+
+            var result = new ConversionResult
+            {
+                Success = true,
+                Message = "Conversion successful",
+                FileName = $"{originalFileName}.pdf"
+            };
+
+            return (result, outputStream);
         }
         catch (Exception ex)
         {
-            result.Success = false;
-            result.Message = $"Conversion failed: {ex.Message}";
-            result.Error = ex.ToString();
+            var result = new ConversionResult
+            {
+                Success = false,
+                Message = $"Conversion failed: {ex.Message}",
+                Error = ex.ToString()
+            };
+            return (result, null);
         }
-
-        return (result, pdfStream);
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
     }
 
-    private (QuestPDF.Infrastructure.IDocument pdfDocument, ConversionResult metadata, MemoryStream docxMs) GenerateDocumentModel(Stream inputDocxStream)
+    private (bool success, string? error) RunLibreOffice(string inputFile, string outputDir)
     {
-        var ms = new MemoryStream();
-        inputDocxStream.CopyTo(ms);
-        ms.Position = 0;
+        _semaphore.Wait(); // Throttle concurrent conversions
 
-        // Sanitize
-        Console.WriteLine("Starting document sanitization...");
+        // Each conversion gets its own user profile so LibreOffice instances don't lock each other
+        var userProfile = Path.Combine(Path.GetTempPath(), $"lo_profile_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(userProfile);
+
         try
         {
-            SanitizeDocument(ms);
-            ms.Position = 0;
-            Console.WriteLine("Document sanitization completed.");
-        }
-        catch (Exception ex)
-        {
-             Console.WriteLine($"Sanitization FAILED: {ex.Message}");
-             ms.Position = 0;
-        }
+            var userProfileUri = OperatingSystem.IsWindows()
+                ? $"file:///{userProfile.Replace('\\', '/')}"
+                : $"file://{userProfile}";
 
-        // Load Numbering & Sections
-        ms.Position = 0;
-        LoadNumberingDefinitions(ms);
-        ms.Position = 0;
-        LoadSectionProperties(ms);
-        ms.Position = 0;
-
-        // Load DocX
-        var wordDocument = DocX.Load(ms);
-
-        // Metadata
-        var metadata = new ConversionResult();
-        ExtractDocumentMetadata(wordDocument, metadata);
-
-        // Track tables
-        var allTables = wordDocument.Tables.ToList();
-        var paragraphsInTables = new HashSet<Paragraph>();
-        foreach (var table in allTables)
-        {
-            foreach (var p in table.Paragraphs)
+            var process = new Process
             {
-                paragraphsInTables.Add(p);
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = _libreOfficePath,
+                    Arguments = string.Join(" ",
+                        $"-env:UserInstallation=\"{userProfileUri}\"",
+                        "--headless",
+                        "--norestore",
+                        // "--infilter=\"Microsoft Word 2007-2013 XML\"",
+                        "--convert-to \"pdf:writer_pdf_Export:{" +
+                            "\\\"UseLosslessCompression\\\":{\\\"type\\\":\\\"boolean\\\",\\\"value\\\":\\\"true\\\"}," +
+                            "\\\"Quality\\\":{\\\"type\\\":\\\"long\\\",\\\"value\\\":\\\"100\\\"}," +
+                            "\\\"EmbedStandardFonts\\\":{\\\"type\\\":\\\"boolean\\\",\\\"value\\\":\\\"true\\\"}," +
+                            "\\\"UseTaggedPDF\\\":{\\\"type\\\":\\\"boolean\\\",\\\"value\\\":\\\"true\\\"}," +
+                            "\\\"ExportBookmarks\\\":{\\\"type\\\":\\\"boolean\\\",\\\"value\\\":\\\"true\\\"}," +
+                            "\\\"IsSkipEmptyPages\\\":{\\\"type\\\":\\\"boolean\\\",\\\"value\\\":\\\"true\\\"}," +
+                            "\\\"SelectPdfVersion\\\":{\\\"type\\\":\\\"long\\\",\\\"value\\\":\\\"0\\\"}" +
+                        "}\"",
+                        $"--outdir \"{outputDir}\"",
+                        $"\"{inputFile}\""
+                    ),
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            _logger.LogInformation("Running: {FileName} {Arguments}", process.StartInfo.FileName, process.StartInfo.Arguments);
+
+            process.Start();
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit(120_000); // 120 second timeout for large documents
+
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                return (false, "LibreOffice timed out after 120 seconds");
             }
-        }
 
-        // Create QuestPDF Document
-        var pdf = QuestPDF.Fluent.Document.Create(container =>
-        {
-            container.Page(page =>
+            _logger.LogInformation("LibreOffice stdout: {Output}", stdout);
+            if (!string.IsNullOrEmpty(stderr))
+                _logger.LogWarning("LibreOffice stderr: {Error}", stderr);
+
+            if (process.ExitCode != 0)
             {
-                page.Size(PageSizes.A4);
-                page.Margin(2, Unit.Centimetre);
-                page.PageColor(Colors.White);
-                page.DefaultTextStyle(x => x.FontSize(11).FontFamily("Arial"));
+                return (false, $"Exit code {process.ExitCode}: {stderr}");
+            }
 
-                // FIXED: Header - Clean implementation without duplication
-                page.Header().Column(headerCol =>
-                {
-                    // First Page Header
-                    headerCol.Item().ShowIf(ctx => ctx.PageNumber == 1 && _sectionProps.TitlePg && !string.IsNullOrEmpty(_sectionProps.FirstPageHeaderId))
-                        .Text(_headerFooterContent.GetValueOrDefault(_sectionProps.FirstPageHeaderId ?? "", ""))
-                        .FontSize(9).AlignRight();
-
-                    // Default Header (Page 2+)
-                    headerCol.Item().ShowIf(ctx => ctx.PageNumber > 1 || (!_sectionProps.TitlePg && !string.IsNullOrEmpty(_sectionProps.HeaderId)))
-                        .PaddingBottom(6).Row(row =>
-                        {
-                            // Left side: Header content (stripped of policy number to avoid duplication)
-                            row.RelativeItem().Text(text =>
-                            {
-                                if (_sectionProps.HeaderId != null && _headerFooterContent.TryGetValue(_sectionProps.HeaderId, out var hText))
-                                {
-                                    var cleanHeader = CleanHeaderFooterText(hText);
-                                    // Strip policy number from header text so it only appears on the right
-                                    cleanHeader = System.Text.RegularExpressions.Regex.Replace(
-                                        cleanHeader ?? "", @"POLICY\s*NO[:\s]*\S+", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
-                                    if (!string.IsNullOrEmpty(cleanHeader))
-                                    {
-                                        text.Span(cleanHeader).FontSize(9);
-                                    }
-                                }
-                            });
-
-                            // Right side: Policy number (always on the right)
-                            row.RelativeItem().AlignRight().Text(text =>
-                            {
-                                if (!string.IsNullOrEmpty(metadata.PolicyNumber))
-                                {
-                                    text.Span($"POLICY NO: {metadata.PolicyNumber}").FontSize(9);
-                                }
-                            });
-                        });
-                });
-
-                // FIXED: Footer - Proper spacing and layout
-                page.Footer().Column(footerColumn =>
-                {
-                    // Top border line
-                    footerColumn.Item().PaddingBottom(4).LineHorizontal(0.5f).LineColor(Colors.Black);
-
-                    // FIXED: Footer content with proper spacing
-                    footerColumn.Item().Row(row =>
-                    {
-                        // Left: Company name (40% width)
-                        row.RelativeItem(4).AlignLeft().Column(c =>
-                        {
-                            c.Item().ShowIf(ctx => ctx.PageNumber == 1 && _sectionProps.TitlePg)
-                                .Text(GetCleanFooterCompanyName(_sectionProps.FirstPageFooterId))
-                                .FontSize(8);
-
-                            c.Item().ShowIf(ctx => ctx.PageNumber > 1 || (!_sectionProps.TitlePg))
-                                .Text(GetCleanFooterCompanyName(_sectionProps.FooterId))
-                                .FontSize(8);
-                        });
-
-                        // Center: Page number (20% width) - FIXED: Use ConstantItem for proper centering
-                        row.ConstantItem(60).AlignCenter().Text(text =>
-                        {
-                            text.CurrentPageNumber().FontSize(8);
-                        });
-
-                        // Right: Insured name (40% width)
-                        row.RelativeItem(4).AlignRight().Text(text =>
-                        {
-                            text.Span(metadata.InsuredName ?? "").FontSize(8);
-                        });
-                    });
-
-                    // Bottom: Regulatory text
-                    footerColumn.Item().PaddingTop(6).AlignCenter()
-                        .Text("Authorised and regulated by the National Insurance Commission [RIC-048]")
-                        .FontSize(7);
-                });
-
-                // Content
-                page.Content().Column(column =>
-                {
-                    RenderContent(column, wordDocument, paragraphsInTables, allTables);
-                });
-            });
-        });
-
-        return (pdf, metadata, ms);
+            return (true, null);
+        }
+        finally
+        {
+            _semaphore.Release();
+            // Cleanup the temporary user profile
+            try { Directory.Delete(userProfile, recursive: true); } catch { }
+        }
     }
 
     /// <summary>
-    /// FIXED: Extract clean company name from footer, removing duplicates and page numbers
+    /// Sanitize filename to remove characters that could cause issues
     /// </summary>
-    private string GetCleanFooterCompanyName(string? footerId)
+    private static string SanitizeFileName(string fileName)
     {
-        if (string.IsNullOrEmpty(footerId) || !_headerFooterContent.TryGetValue(footerId, out var footerText))
-        {
-            return "ZENITH GENERAL INSURANCE CO. LTD";
-        }
-
-        // Remove common duplicates and clean up
-        var cleaned = footerText;
-
-        // Remove page numbers that might be embedded
-        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"\b\d+\b", "").Trim();
-
-        // Remove insured name if it appears
-        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"VINCINTORE DENTAL CLINIC LIMITED", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
-
-        // Remove "Authorised and regulated" text
-        cleaned = System.Text.RegularExpressions.Regex.Replace(cleaned, @"Authorised and regulated.*", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Trim();
-
-        // If nothing left, use default
-        if (string.IsNullOrWhiteSpace(cleaned))
-        {
-            return "ZENITH GENERAL INSURANCE CO. LTD";
-        }
-
-        return cleaned;
+        var invalid = Path.GetInvalidFileNameChars();
+        var sanitized = string.Join("_", fileName.Split(invalid, StringSplitOptions.RemoveEmptyEntries));
+        // Also replace spaces to avoid shell quoting issues
+        return sanitized.Trim();
     }
 
-    /// <summary>
-    /// FIXED: Clean header text to remove duplicate policy numbers
-    /// </summary>
-    private string CleanHeaderFooterText(string text)
+    private static string FindLibreOffice()
     {
-        if (string.IsNullOrEmpty(text)) return text;
-
-        // Remove duplicate "POLICY NO:" patterns
-        var cleaned = System.Text.RegularExpressions.Regex.Replace(
-            text,
-            @"POLICY NO:\s*[^\s]+\s*POLICY NO:\s*[^\s]+",
-            match =>
-            {
-                // Keep only the first occurrence
-                var parts = match.Value.Split(new[] { "POLICY NO:" }, StringSplitOptions.RemoveEmptyEntries);
-                return parts.Length > 0 ? $"POLICY NO:{parts[0].Trim()}" : match.Value;
-            },
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase
-        );
-
-        return cleaned.Trim();
-    }
-
-    private void ExtractDocumentMetadata(DocX wordDocument, ConversionResult result)
-    {
-        // First try paragraphs (works when label and value are in the same paragraph)
-        foreach (var p in wordDocument.Paragraphs)
+        // Windows paths
+        var windowsPaths = new[]
         {
-            var text = p.Text?.Trim() ?? string.Empty;
-            if (string.IsNullOrEmpty(text)) continue;
-
-            if (string.IsNullOrEmpty(result.InsuredName) && text.StartsWith("INSURED:", StringComparison.OrdinalIgnoreCase))
-            {
-                var parts = text.Split(':', 2);
-                if (parts.Length == 2 && !string.IsNullOrWhiteSpace(parts[1]))
-                    result.InsuredName = parts[1].Trim();
-            }
-
-            if (string.IsNullOrEmpty(result.PolicyNumber))
-            {
-                if (text.StartsWith("POLICY NO:", StringComparison.OrdinalIgnoreCase) ||
-                    text.StartsWith("POLICY NUMBER:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var parts = text.Split(':', 2);
-                    if (parts.Length == 2 && !string.IsNullOrWhiteSpace(parts[1]))
-                        result.PolicyNumber = parts[1].Trim();
-                }
-            }
-
-            if (!string.IsNullOrEmpty(result.InsuredName) && !string.IsNullOrEmpty(result.PolicyNumber))
-                break;
-        }
-
-        // If still missing, search table rows (label and value may be in adjacent cells)
-        if (string.IsNullOrEmpty(result.InsuredName) || string.IsNullOrEmpty(result.PolicyNumber))
-        {
-            foreach (var table in wordDocument.Tables)
-            {
-                foreach (var row in table.Rows)
-                {
-                    for (int i = 0; i < row.Cells.Count - 1; i++)
-                    {
-                        var cellText = string.Join(" ", row.Cells[i].Paragraphs.Select(p => p.Text?.Trim() ?? "")).Trim();
-                        var nextCellText = string.Join(" ", row.Cells[i + 1].Paragraphs.Select(p => p.Text?.Trim() ?? "")).Trim();
-
-                        if (string.IsNullOrEmpty(result.InsuredName) &&
-                            (cellText.Equals("INSURED:", StringComparison.OrdinalIgnoreCase) ||
-                             cellText.Equals("INSURED", StringComparison.OrdinalIgnoreCase) ||
-                             cellText.Equals("INSURED :", StringComparison.OrdinalIgnoreCase)))
-                        {
-                            if (!string.IsNullOrWhiteSpace(nextCellText))
-                                result.InsuredName = nextCellText.Trim();
-                        }
-
-                        if (string.IsNullOrEmpty(result.PolicyNumber) &&
-                            (cellText.StartsWith("POLICY NO", StringComparison.OrdinalIgnoreCase) ||
-                             cellText.StartsWith("POLICY NUMBER", StringComparison.OrdinalIgnoreCase)))
-                        {
-                            // Value might be after colon in same cell or in next cell
-                            var parts = cellText.Split(':', 2);
-                            if (parts.Length == 2 && !string.IsNullOrWhiteSpace(parts[1]))
-                                result.PolicyNumber = parts[1].Trim();
-                            else if (!string.IsNullOrWhiteSpace(nextCellText))
-                                result.PolicyNumber = nextCellText.Trim();
-                        }
-                    }
-                }
-
-                if (!string.IsNullOrEmpty(result.InsuredName) && !string.IsNullOrEmpty(result.PolicyNumber))
-                    break;
-            }
-        }
-    }
-
-    private void SanitizeDocument(Stream stream)
-    {
-        using (var archive = new ZipArchive(stream, ZipArchiveMode.Update, true))
-        {
-            // 1. Identify altChunks to remove
-            var documentEntry = archive.GetEntry("word/document.xml");
-            var altChunkIds = new HashSet<string>();
-
-            if (documentEntry != null)
-            {
-                XDocument doc;
-                using (var entryStream = documentEntry.Open())
-                {
-                    doc = XDocument.Load(entryStream);
-                }
-
-                XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-                XNamespace r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-
-                var altChunkElements = doc.Descendants(w + "altChunk").ToList();
-
-                foreach (var ac in altChunkElements)
-                {
-                     var rId = ac.Attribute(r + "id")?.Value;
-                     if (!string.IsNullOrEmpty(rId))
-                     {
-                         altChunkIds.Add(rId);
-                     }
-                }
-
-                if (altChunkElements.Any())
-                {
-                    Console.WriteLine($"Found {altChunkElements.Count} altChunks in document.xml. Removing...");
-                    altChunkElements.Remove();
-
-                    using (var entryStream = documentEntry.Open())
-                    {
-                        entryStream.SetLength(0);
-                        doc.Save(entryStream);
-                    }
-                }
-            }
-
-            // 2. Remove relationships and capture targets
-            var targetsToRemove = new HashSet<string>();
-            var relsEntry = archive.GetEntry("word/_rels/document.xml.rels");
-            if (relsEntry != null)
-            {
-                XDocument relsDoc;
-                using (var entryStream = relsEntry.Open())
-                {
-                    relsDoc = XDocument.Load(entryStream);
-                }
-
-                XNamespace rel = "http://schemas.openxmlformats.org/package/2006/relationships";
-
-                var badRels = relsDoc.Descendants(rel + "Relationship")
-                    .Where(r =>
-                        (r.Attribute("Id")?.Value != null && altChunkIds.Contains(r.Attribute("Id")!.Value)) ||
-                        r.Attribute("Type")?.Value.Contains("aFChunk") == true
-                     )
-                    .ToList();
-
-                foreach (var br in badRels)
-                {
-                    var target = br.Attribute("Target")?.Value;
-                    if (!string.IsNullOrEmpty(target))
-                    {
-                        targetsToRemove.Add(target);
-                    }
-                }
-
-                if (badRels.Any())
-                {
-                    Console.WriteLine($"Removing {badRels.Count} relationships.");
-                    badRels.Remove();
-
-                    using (var entryStream = relsEntry.Open())
-                    {
-                        entryStream.SetLength(0);
-                        relsDoc.Save(entryStream);
-                    }
-                }
-            }
-
-            // 3. Delete chunk files
-            foreach (var target in targetsToRemove)
-            {
-                 string entryName = target.TrimStart('/');
-                 if (!entryName.StartsWith("word/") && !entryName.Contains("/"))
-                 {
-                     entryName = "word/" + entryName;
-                 }
-
-                 var chunkEntry = archive.GetEntry(entryName);
-                 if (chunkEntry != null)
-                 {
-                     Console.WriteLine($"Deleting entry: {entryName}");
-                     chunkEntry.Delete();
-                 }
-            }
-
-            // 4. Remove from [Content_Types].xml
-            var contentTypesEntry = archive.GetEntry("[Content_Types].xml");
-            if (contentTypesEntry != null)
-            {
-                XDocument contentTypesDoc;
-                using (var entryStream = contentTypesEntry.Open())
-                {
-                    contentTypesDoc = XDocument.Load(entryStream);
-                }
-
-                XNamespace ns = "http://schemas.openxmlformats.org/package/2006/content-types";
-                var badTypes = contentTypesDoc.Descendants(ns + "Override")
-                    .Where(t => t.Attribute("PartName")?.Value.Contains("afchunk") == true)
-                    .ToList();
-
-                 badTypes.AddRange(contentTypesDoc.Descendants(ns + "Default")
-                    .Where(t => t.Attribute("Extension")?.Value.Contains("afchunk") == true));
-
-                if (badTypes.Any())
-                {
-                     Console.WriteLine($"Removing {badTypes.Count} content types.");
-                     badTypes.Remove();
-                     using (var entryStream = contentTypesEntry.Open())
-                     {
-                         entryStream.SetLength(0);
-                         contentTypesDoc.Save(entryStream);
-                     }
-                }
-            }
-        }
-    }
-
-    private void RenderContent(ColumnDescriptor column, DocX wordDocument, HashSet<Paragraph> paragraphsInTables, List<Table> allTables)
-    {
-        _numCounters.Clear();
-
-        // Reset tracking fields for this document
-        _hasRenderedFirstInsuranceType = false;
-        _hasContentSincePageBreak = true;
-        _imageCount = 0;
-        _inPolicyConditions = false;
-
-        bool insideImportantSection = false;
-        List<Paragraph> importantParagraphs = new();
-
-        XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-        // Xceed.Words.NET's wordDocument.Xml IS the body element directly
-        XElement? bodyXml = null;
-
-        if (wordDocument.Xml != null)
-        {
-            // Approach 1: If wordDocument.Xml IS the body element (most common case)
-            if (wordDocument.Xml.Name.LocalName == "body")
-            {
-                bodyXml = wordDocument.Xml;
-            }
-            // Approach 2: Body is a direct child of document
-            else if (wordDocument.Xml.Name.LocalName == "document")
-            {
-                bodyXml = wordDocument.Xml.Element(w + "body");
-            }
-            // Approach 3: Search descendants
-            if (bodyXml == null)
-            {
-                bodyXml = wordDocument.Xml.Descendants(w + "body").FirstOrDefault();
-            }
-            // Approach 4: Just iterate all child elements if it contains p/tbl
-            if (bodyXml == null && wordDocument.Xml.Elements().Any(e => e.Name.LocalName == "p" || e.Name.LocalName == "tbl"))
-            {
-                bodyXml = wordDocument.Xml;
-            }
-        }
-
-        if (bodyXml == null)
-        {
-            Console.WriteLine("WARNING: Could not access document XML body, tables may render out of order");
-            ProcessAllParagraphsThenTables(column, wordDocument, paragraphsInTables, allTables);
-            return;
-        }
-
-        int tableCount = 0;
-
-        // Process elements in document order (paragraphs AND tables interleaved)
-        foreach (var element in bodyXml.Elements())
-        {
-            var tagName = element.Name.LocalName;
-
-            if (tagName == "p")  // Paragraph
-            {
-                // Find the corresponding Paragraph object by comparing XML
-                var paragraph = wordDocument.Paragraphs.FirstOrDefault(p => p.Xml == element);
-                if (paragraph == null)
-                {
-                    // Try matching by text content as fallback
-                    var elementText = string.Join("", element.Descendants(w + "t").Select(t => t.Value));
-                    paragraph = wordDocument.Paragraphs.FirstOrDefault(p => p.Text == elementText);
-                }
-                if (paragraph == null) continue;
-
-                if (paragraphsInTables.Contains(paragraph))
-                    continue;
-
-                ProcessSingleParagraph(column, wordDocument, paragraph, ref insideImportantSection, ref importantParagraphs);
-            }
-            else if (tagName == "tbl")  // Table
-            {
-                tableCount++;
-
-                // Find the corresponding Table object
-                var table = allTables.FirstOrDefault(t => t.Xml == element);
-                if (table == null && allTables.Count >= tableCount)
-                {
-                    // Fallback: use table by index
-                    table = allTables[tableCount - 1];
-                }
-                if (table == null) continue;
-
-                // Close IMPORTANT section before table
-                if (insideImportantSection && importantParagraphs.Count > 0)
-                {
-                    RenderImportantBox(column, importantParagraphs);
-                    importantParagraphs.Clear();
-                    insideImportantSection = false;
-                }
-
-                column.Item().PaddingVertical(10);
-                RenderTable(column, table);
-            }
-        }
-
-        // Render remaining IMPORTANT section
-        if (insideImportantSection && importantParagraphs.Count > 0)
-        {
-            RenderImportantBox(column, importantParagraphs);
-        }
-    }
-
-    // NEW HELPER METHOD: Extract single paragraph processing logic
-    private void ProcessSingleParagraph(ColumnDescriptor column, DocX wordDocument, Paragraph paragraph,
-                                       ref bool insideImportantSection, ref List<Paragraph> importantParagraphs)
-    {
-        var paragraphText = paragraph.Text?.Trim() ?? string.Empty;
-
-        // Forced page breaks for major sections
-        foreach (var section in NewPageSections)
-        {
-            if (paragraphText.StartsWith(section, StringComparison.OrdinalIgnoreCase))
-            {
-                if (insideImportantSection && importantParagraphs.Count > 0)
-                {
-                    RenderImportantBox(column, importantParagraphs);
-                    importantParagraphs.Clear();
-                    insideImportantSection = false;
-                }
-                // ISSUE 5 FIX: Only add page break if content was rendered since last break
-                if (_hasContentSincePageBreak)
-                {
-                    column.Item().PageBreak();
-                    _hasContentSincePageBreak = false;
-                }
-                break;
-            }
-        }
-
-        // Page breaks (form feed characters)
-        if (paragraph.Text?.Contains("\f") == true || paragraph.Text?.Contains("\x0C") == true)
-        {
-            if (insideImportantSection && importantParagraphs.Count > 0)
-            {
-                RenderImportantBox(column, importantParagraphs);
-                importantParagraphs.Clear();
-                insideImportantSection = false;
-            }
-
-            // ISSUE 5 FIX: Only add page break if content was rendered since last break
-            if (_hasContentSincePageBreak)
-            {
-                column.Item().PageBreak();
-                _hasContentSincePageBreak = false;
-            }
-            if (string.IsNullOrWhiteSpace(paragraph.Text?.Replace("\f", "").Replace("\x0C", "")))
-                return;
-        }
-
-        // Check for XML-based page breaks (w:pageBreakBefore or w:br type="page")
-        {
-            XNamespace wpb = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-            var pPr = paragraph.Xml?.Element(wpb + "pPr");
-            bool hasPageBreakBefore = pPr?.Element(wpb + "pageBreakBefore") != null;
-            bool hasRunPageBreak = paragraph.Xml?.Descendants(wpb + "br")
-                .Any(br => br.Attribute(wpb + "type")?.Value == "page") == true;
-
-            if (hasPageBreakBefore || hasRunPageBreak)
-            {
-                if (_hasContentSincePageBreak)
-                {
-                    column.Item().PageBreak();
-                    _hasContentSincePageBreak = false;
-                }
-            }
-        }
-
-        // Images
-        IList<Picture> pictures = null;
-        bool manualExtractionNeeded = false;
-        try
-        {
-           pictures = paragraph.Pictures;
-        }
-        catch
-        {
-            manualExtractionNeeded = true;
-        }
-
-        if (!manualExtractionNeeded && pictures != null && pictures.Count > 0)
-        {
-            foreach (var picture in pictures)
-            {
-                try
-                {
-                    var imageId = picture.Id;
-                    ProcessImage(column, wordDocument, imageId, null, null);
-                }
-                catch { /* Skip failed images */ }
-            }
-
-            if (string.IsNullOrWhiteSpace(paragraphText))
-                return;
-        }
-        else if (manualExtractionNeeded)
-        {
-             try
-             {
-                 var manualImages = ManuallyExtractImages(paragraph);
-                 if (manualImages.Count > 0)
-                 {
-                     foreach (var img in manualImages)
-                     {
-                         ProcessImage(column, wordDocument, img.Id, img.Width, img.Height);
-                     }
-
-                     if (string.IsNullOrWhiteSpace(paragraphText))
-                        return;
-                 }
-             }
-             catch (Exception ex)
-             {
-                 Console.WriteLine($"Manual image extraction failed: {ex.Message}");
-             }
-        }
-
-        // FIXED: Better empty paragraph handling with consistent spacing
-        if (string.IsNullOrWhiteSpace(paragraphText))
-        {
-            float spacingAfter = GetParagraphSpacingAfter(paragraph);
-            column.Item().Height(spacingAfter > 0 ? Math.Max(spacingAfter, 4) : 6);
-            return;
-        }
-
-        // Detect IMPORTANT section
-        if (paragraphText.Equals("IMPORTANT", StringComparison.OrdinalIgnoreCase))
-        {
-            insideImportantSection = true;
-            importantParagraphs.Add(paragraph);
-            return;
-        }
-
-        // Collect IMPORTANT section content
-        if (insideImportantSection)
-        {
-            bool isEndOfImportant =
-                paragraphText.StartsWith("Followed by", StringComparison.OrdinalIgnoreCase) ||
-                paragraphText.StartsWith("PLEASE NOTE", StringComparison.OrdinalIgnoreCase) ||
-                paragraphText.StartsWith("POLICY CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
-                paragraphText.StartsWith("Section A", StringComparison.OrdinalIgnoreCase) ||
-                IsInsuranceTypeHeading(paragraphText);
-
-            if (isEndOfImportant)
-            {
-                RenderImportantBox(column, importantParagraphs);
-                importantParagraphs.Clear();
-                insideImportantSection = false;
-            }
-            else
-            {
-                importantParagraphs.Add(paragraph);
-                return;
-            }
-        }
-
-        // Label-value pairs
-        if (IsLabelValuePair(paragraphText))
-        {
-            RenderLabelValuePair(column, paragraph);
-            return;
-        }
-
-        // FIXED: Period of insurance handling
-        if (paragraphText.StartsWith("PERIOD OF", StringComparison.OrdinalIgnoreCase))
-        {
-            column.Item().PaddingTop(10).PaddingBottom(4).Row(row =>
-            {
-                row.ConstantItem(160).Text(text => text.Span("PERIOD OF").Bold().FontSize(11));
-                row.RelativeItem();
-            });
-            return;
-        }
-
-        if (paragraphText.StartsWith("INSURANCE:", StringComparison.OrdinalIgnoreCase))
-        {
-            var value = paragraphText.Substring(10).Trim();
-            column.Item().PaddingBottom(4).Row(row =>
-            {
-                row.ConstantItem(160).Text(text => text.Span("INSURANCE:").Bold().FontSize(11));
-                row.RelativeItem().Text(value).FontSize(11);
-            });
-            return;
-        }
-
-        if (paragraphText.StartsWith("FROM:", StringComparison.OrdinalIgnoreCase))
-        {
-            var value = paragraphText.Substring(5).Trim();
-            column.Item().PaddingBottom(2).PaddingLeft(160).Text($"FROM: {value}").FontSize(11);
-            return;
-        }
-
-        if (paragraphText.StartsWith("TO:", StringComparison.OrdinalIgnoreCase) && paragraphText.Length < 50)
-        {
-            var value = paragraphText.Substring(3).Trim();
-            column.Item().PaddingBottom(8).PaddingLeft(160).Text($"TO: {value}").FontSize(11);
-            return;
-        }
-
-        // Heading detection
-        bool isStyleHeading = paragraph.StyleId?.Contains("Heading") == true;
-        bool isValidHeading = IsValidHeading(paragraphText, paragraph, isStyleHeading);
-
-        if (isValidHeading)
-        {
-            var alignment = paragraph.Alignment;
-            float fontSize = 14;
-            float paddingTop = GetParagraphSpacingBefore(paragraph);
-            float paddingBottom = GetParagraphSpacingAfter(paragraph);
-
-            if (paddingTop <= 0) paddingTop = 12;
-            if (paddingBottom <= 0) paddingBottom = 8;
-
-            if (isStyleHeading && paragraph.StyleId != null)
-            {
-                if (paragraph.StyleId.Contains("1")) { fontSize = 16; paddingTop = 16; }
-                else if (paragraph.StyleId.Contains("2")) { fontSize = 14; paddingTop = 14; }
-                else if (paragraph.StyleId.Contains("3")) { fontSize = 13; paddingTop = 12; }
-                else { fontSize = 12; paddingTop = 10; }
-            }
-            else if (IsInsuranceTypeHeading(paragraphText))
-            {
-                // ISSUE 2 FIX: Page break before second insurance type heading
-                if (_hasRenderedFirstInsuranceType)
-                {
-                    column.Item().PageBreak();
-                }
-                _hasRenderedFirstInsuranceType = true;
-
-                fontSize = 16;
-                paddingTop = 20;
-                paddingBottom = 16;
-                alignment = Alignment.center;
-            }
-            else if (paragraphText.StartsWith("MEMO", StringComparison.OrdinalIgnoreCase))
-            {
-                fontSize = 13;
-                paddingTop = 14;
-                paddingBottom = 8;
-            }
-
-            // ISSUE 7: Track if entering/leaving policy conditions section
-            if (paragraphText.StartsWith("POLICY CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
-                paragraphText.StartsWith("CONDITIONS", StringComparison.OrdinalIgnoreCase) ||
-                paragraphText.StartsWith("EXCEPTIONS", StringComparison.OrdinalIgnoreCase))
-            {
-                _inPolicyConditions = true;
-            }
-            else
-            {
-                // Reset when a different heading section is encountered
-                _inPolicyConditions = false;
-            }
-
-            column.Item().EnsureSpace(60).PaddingTop(paddingTop).PaddingBottom(paddingBottom).Text(text =>
-            {
-                text.Span(paragraphText).Bold().FontSize(fontSize);
-                ApplyAlignment(text, alignment);
-            });
-            _hasContentSincePageBreak = true;
-            return;
-        }
-
-        // Section headings (bold, short)
-        bool isBold = paragraph.MagicText.Count > 0 &&
-                      paragraph.MagicText.All(r => r.formatting?.Bold == true);
-        bool isBoldShort = paragraphText.Length < 60 && isBold &&
-                           !IsExcludedFromHeading(paragraphText) &&
-                           !paragraphText.EndsWith(":-") &&
-                           !paragraphText.EndsWith(":") &&
-                           paragraph.MagicText.Count <= 3;
-
-        if (isBoldShort && !paragraph.IsListItem && !IsAllCaps(paragraphText))
-        {
-            column.Item().EnsureSpace(60).PaddingTop(8).PaddingBottom(4).Text(text =>
-            {
-                ProcessTextRuns(text, paragraph);
-                ApplyAlignment(text, paragraph.Alignment);
-            });
-            return;
-        }
-
-        // List items
-        if (paragraph.IsListItem)
-        {
-            RenderListItem(column, paragraph);
-            return;
-        }
-
-        // Regular paragraphs
-        RenderParagraph(column, paragraph);
-    }
-
-    // FALLBACK METHOD: Old behavior if XML access fails
-    private void ProcessAllParagraphsThenTables(ColumnDescriptor column, DocX wordDocument,
-                                               HashSet<Paragraph> paragraphsInTables, List<Table> allTables)
-    {
-        bool insideImportantSection = false;
-        List<Paragraph> importantParagraphs = new();
-
-        foreach (var paragraph in wordDocument.Paragraphs)
-        {
-            if (paragraphsInTables.Contains(paragraph))
-                continue;
-
-            ProcessSingleParagraph(column, wordDocument, paragraph, ref insideImportantSection, ref importantParagraphs);
-        }
-
-        if (insideImportantSection && importantParagraphs.Count > 0)
-        {
-            RenderImportantBox(column, importantParagraphs);
-        }
-
-        foreach (var table in allTables)
-        {
-            column.Item().PaddingVertical(10);
-            RenderTable(column, table);
-        }
-    }
-
-    private static bool IsAllCaps(string text)
-    {
-        if (string.IsNullOrEmpty(text)) return false;
-        var letters = text.Where(char.IsLetter).ToList();
-        if (letters.Count == 0) return false;
-        return letters.All(char.IsUpper);
-    }
-
-    private static bool IsInsuranceTypeHeading(string text)
-    {
-        foreach (var type in InsuranceTypes)
-        {
-            if (text.Equals(type, StringComparison.OrdinalIgnoreCase) ||
-                text.StartsWith(type, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
-    }
-
-    private static bool IsExcludedFromHeading(string text)
-    {
-        foreach (var pattern in ExcludePatterns)
-        {
-            if (text.StartsWith(pattern, StringComparison.OrdinalIgnoreCase) ||
-                text.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        if (text.EndsWith(":-") || text.EndsWith(": -"))
-            return true;
-
-        if (text.Length > 80)
-            return true;
-
-        return false;
-    }
-
-    private static bool IsValidHeading(string text, Paragraph paragraph, bool isStyleHeading)
-    {
-        if (isStyleHeading)
-            return true;
-
-        foreach (var heading in ValidHeadings)
-        {
-            if (text.StartsWith(heading, StringComparison.OrdinalIgnoreCase))
-            {
-                // Only treat as heading if the text is short (a real heading, not a long paragraph that starts with these words)
-                if (text.Length <= heading.Length + 20)
-                    return true;
-            }
-        }
-
-        bool isAllCaps = IsAllCaps(text);
-        bool isBold = paragraph.MagicText.Count > 0 &&
-                      paragraph.MagicText.All(r => r.formatting?.Bold == true);
-        bool isShort = text.Length < 50;
-        bool isExcluded = IsExcludedFromHeading(text);
-
-        if (isAllCaps && isBold && isShort && !isExcluded && !text.Contains(","))
-            return true;
-
-        return false;
-    }
-
-    private float GetParagraphSpacingBefore(Paragraph paragraph)
-    {
-        return ExtractParagraphStyle(paragraph).SpacingBefore ?? 0;
-    }
-
-    private float GetParagraphSpacingAfter(Paragraph paragraph)
-    {
-        return ExtractParagraphStyle(paragraph).SpacingAfter ?? 0;
-    }
-
-    private static bool IsLabelValuePair(string text)
-    {
-        string[] labels = { "INSURED:", "POLICY NUMBER:", "POLICY NO:" };
-        foreach (var label in labels)
-        {
-            if (text.StartsWith(label, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-        return false;
-    }
-
-    private void RenderLabelValuePair(ColumnDescriptor column, Paragraph paragraph)
-    {
-        var text = paragraph.Text?.Trim() ?? string.Empty;
-        var colonIdx = text.IndexOf(':');
-        if (colonIdx < 0) return;
-
-        var label = text.Substring(0, colonIdx + 1);
-        var value = text.Substring(colonIdx + 1).Trim();
-
-        column.Item().PaddingTop(8).PaddingBottom(6).Row(row =>
-        {
-            row.ConstantItem(160).Text(t => t.Span(label).Bold().FontSize(11));
-            row.RelativeItem().Text(t => t.Span(value).Bold().FontSize(11));
-        });
-    }
-
-    private struct ManualImageInfo
-    {
-        public string Id;
-        public float? Width;
-        public float? Height;
-    }
-
-    private List<ManualImageInfo> ManuallyExtractImages(Paragraph paragraph)
-    {
-        var results = new List<ManualImageInfo>();
-        var xml = paragraph.Xml;
-
-        if (xml == null) return results;
-
-        XNamespace a = "http://schemas.openxmlformats.org/drawingml/2006/main";
-        XNamespace r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-        XNamespace wp = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
-
-        var blips = xml.Descendants(a + "blip");
-        foreach (var blip in blips)
-        {
-            var embed = blip.Attribute(r + "embed")?.Value;
-            if (!string.IsNullOrEmpty(embed))
-            {
-                float? width = null;
-                float? height = null;
-
-                var xfrm = blip.Ancestors(a + "graphic").FirstOrDefault()?.Descendants(a + "xfrm").FirstOrDefault();
-                if (xfrm != null)
-                {
-                    var ext = xfrm.Element(a + "ext");
-                    if (ext != null)
-                    {
-                         var cx = ext.Attribute("cx")?.Value;
-                         var cy = ext.Attribute("cy")?.Value;
-
-                         if (long.TryParse(cx, out long cxVal)) width = cxVal * EMUS_TO_POINTS;
-                         if (long.TryParse(cy, out long cyVal)) height = cyVal * EMUS_TO_POINTS;
-                    }
-                }
-
-                results.Add(new ManualImageInfo { Id = embed, Width = width, Height = height });
-            }
-        }
-
-        return results;
-    }
-
-    private struct ParagraphStyle
-    {
-        public Alignment? Alignment;
-        public float? SpacingBefore;
-        public float? SpacingAfter;
-        public float? LineSpacing;
-        public float LeftIndent;
-        public float RightIndent;
-        public float HangingIndent;
-        public float FirstLineIndent;
-    }
-
-    private ParagraphStyle ExtractParagraphStyle(Paragraph paragraph)
-    {
-        var style = new ParagraphStyle
-        {
-            Alignment = paragraph.Alignment,
-            LeftIndent = paragraph.IndentationBefore * TWIPS_TO_POINTS,
-            RightIndent = paragraph.IndentationAfter * TWIPS_TO_POINTS,
-            SpacingBefore = (float)paragraph.LineSpacingBefore * TWIPS_TO_POINTS,
-            SpacingAfter = (float)paragraph.LineSpacingAfter * TWIPS_TO_POINTS
+            @"C:\Program Files\LibreOffice\program\soffice.exe",
+            @"C:\Program Files (x86)\LibreOffice\program\soffice.exe"
         };
 
-        var pPr = paragraph.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "pPr");
-        if (pPr != null)
+        // Linux paths
+        var linuxPaths = new[]
         {
-            XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-            var ind = pPr.Element(w + "ind");
-            if (ind != null)
-            {
-                if (float.TryParse(ind.Attribute(w + "left")?.Value, out float left)) style.LeftIndent = left * TWIPS_TO_POINTS;
-                if (float.TryParse(ind.Attribute(w + "right")?.Value, out float right)) style.RightIndent = right * TWIPS_TO_POINTS;
-                if (float.TryParse(ind.Attribute(w + "hanging")?.Value, out float hanging)) style.HangingIndent = hanging * TWIPS_TO_POINTS;
-                if (float.TryParse(ind.Attribute(w + "firstLine")?.Value, out float first)) style.FirstLineIndent = first * TWIPS_TO_POINTS;
-            }
-
-            var spacing = pPr.Element(w + "spacing");
-            if (spacing != null)
-            {
-                if (float.TryParse(spacing.Attribute(w + "before")?.Value, out float before)) style.SpacingBefore = before * TWIPS_TO_POINTS;
-                if (float.TryParse(spacing.Attribute(w + "after")?.Value, out float after)) style.SpacingAfter = after * TWIPS_TO_POINTS;
-
-                var line = spacing.Attribute(w + "line")?.Value;
-                var lineRule = spacing.Attribute(w + "lineRule")?.Value;
-                if (float.TryParse(line, out float lineVal))
-                {
-                    if (lineRule == "atLeast" || lineRule == "exact") style.LineSpacing = lineVal * TWIPS_TO_POINTS;
-                    else style.LineSpacing = lineVal / 240f * 12f;
-                }
-            }
-
-            var jc = pPr.Element(w + "jc");
-            if (jc != null)
-            {
-                var val = jc.Attribute(w + "val")?.Value;
-                if (val == "both") style.Alignment = Alignment.both;
-            }
-        }
-
-        return style;
-    }
-
-    private struct RunStyle
-    {
-        public string FontName;
-        public float? FontSize;
-        public string Color;
-        public bool Bold;
-        public bool Italic;
-        public bool Underline;
-    }
-
-    private RunStyle ExtractRunStyle(dynamic run)
-    {
-        var style = new RunStyle();
-
-        // Method 1: Try direct properties
-        try { style.FontName = run.FontFamily?.Name; } catch { }
-        try { style.FontSize = (float?)run.FontSize; } catch { }
-        try { style.Bold = run.Bold == true; } catch { }
-        try { style.Italic = run.Italic == true; } catch { }
-        try { style.Underline = run.UnderlineStyle != UnderlineStyle.none; } catch { }
-
-        // Method 2: Check run.formatting property (used by MagicText)
-        try
-        {
-            var formatting = run.formatting;
-            if (formatting != null)
-            {
-                if (formatting.Bold == true) style.Bold = true;
-                if (formatting.Italic == true) style.Italic = true;
-                if (formatting.UnderlineStyle != null && formatting.UnderlineStyle != UnderlineStyle.none)
-                    style.Underline = true;
-                if (formatting.FontFamily?.Name != null)
-                    style.FontName = formatting.FontFamily.Name;
-                if (formatting.FontSize != null)
-                    style.FontSize = (float?)formatting.FontSize;
-            }
-        }
-        catch { }
-
-        // Method 3: Parse XML directly for most reliable detection
-        XElement? rPr = null;
-        try { rPr = run.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "rPr"); } catch { }
-
-        if (rPr != null)
-        {
-            XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-            var rFonts = rPr.Element(w + "rFonts");
-            if (rFonts != null)
-            {
-                var font = rFonts.Attribute(w + "ascii")?.Value ?? rFonts.Attribute(w + "hAnsi")?.Value;
-                if (!string.IsNullOrEmpty(font)) style.FontName = font;
-            }
-
-            var sz = rPr.Element(w + "sz");
-            if (sz != null)
-            {
-                if (float.TryParse(sz.Attribute(w + "val")?.Value, out float halfPts))
-                    style.FontSize = halfPts / 2f;
-            }
-
-            var color = rPr.Element(w + "color");
-            if (color != null)
-            {
-                style.Color = color.Attribute(w + "val")?.Value;
-            }
-
-            // XML-based detection is most reliable - these override property checks
-            // <w:b/> means bold, <w:b w:val="0"/> means not bold
-            var boldElement = rPr.Element(w + "b");
-            if (boldElement != null)
-            {
-                var val = boldElement.Attribute(w + "val")?.Value;
-                style.Bold = val == null || val == "1" || val == "true";
-            }
-
-            var italicElement = rPr.Element(w + "i");
-            if (italicElement != null)
-            {
-                var val = italicElement.Attribute(w + "val")?.Value;
-                style.Italic = val == null || val == "1" || val == "true";
-            }
-
-            var underlineElement = rPr.Element(w + "u");
-            if (underlineElement != null)
-            {
-                var val = underlineElement.Attribute(w + "val")?.Value;
-                style.Underline = val != "none";
-            }
-        }
-
-        return style;
-    }
-
-    private struct CellStyle
-    {
-        public int GridSpan;
-        public bool IsVerticalMergeRestart;
-        public bool IsVerticalMergeContinue;
-        public string TopBorderColor;
-        public float TopBorderSize;
-        public string BottomBorderColor;
-        public float BottomBorderSize;
-        public string LeftBorderColor;
-        public float LeftBorderSize;
-        public string RightBorderColor;
-        public float RightBorderSize;
-    }
-
-    private CellStyle ExtractCellStyle(Cell cell)
-    {
-        var style = new CellStyle
-        {
-            GridSpan = 1,
-            TopBorderSize = 0.5f,
-            BottomBorderSize = 0.5f,
-            LeftBorderSize = 0.5f,
-            RightBorderSize = 0.5f,
-            TopBorderColor = "000000",
-            BottomBorderColor = "000000",
-            LeftBorderColor = "000000",
-            RightBorderColor = "000000"
+            "/usr/bin/libreoffice",
+            "/usr/bin/soffice",
+            "/usr/local/bin/libreoffice",
+            "/usr/local/bin/soffice",
+            "/snap/bin/libreoffice"
         };
 
-        var tcPr = cell.Xml?.Element(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "tcPr");
-        if (tcPr != null)
+        var paths = OperatingSystem.IsWindows() ? windowsPaths : linuxPaths;
+
+        foreach (var path in paths)
         {
-            XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-            var gridSpan = tcPr.Element(w + "gridSpan");
-            if (gridSpan != null && int.TryParse(gridSpan.Attribute(w + "val")?.Value, out int gs))
-            {
-                style.GridSpan = gs;
-            }
-
-            var vMerge = tcPr.Element(w + "vMerge");
-            if (vMerge != null)
-            {
-                var val = vMerge.Attribute(w + "val")?.Value;
-                if (val == "restart") style.IsVerticalMergeRestart = true;
-                else style.IsVerticalMergeContinue = true;
-            }
-
-            var tcBorders = tcPr.Element(w + "tcBorders");
-            if (tcBorders != null)
-            {
-                ProcessBorder(tcBorders.Element(w + "top"), out style.TopBorderSize, out style.TopBorderColor);
-                ProcessBorder(tcBorders.Element(w + "bottom"), out style.BottomBorderSize, out style.BottomBorderColor);
-                ProcessBorder(tcBorders.Element(w + "left"), out style.LeftBorderSize, out style.LeftBorderColor);
-                ProcessBorder(tcBorders.Element(w + "right"), out style.RightBorderSize, out style.RightBorderColor);
-            }
+            if (File.Exists(path))
+                return path;
         }
 
-        return style;
-    }
-
-    private class NumberingLevel
-    {
-        public int LevelIndex;
-        public string Start;
-        public string NumberFormat;
-        public string LevelText;
-        public float Indent;
-        public float Hanging;
-    }
-
-    private class NumberingDefinition
-    {
-        public int AbstractNumId;
-        public Dictionary<int, NumberingLevel> Levels = new();
-    }
-
-    private Dictionary<int, int> _numIdToAbstractId = new();
-    private Dictionary<int, NumberingDefinition> _abstractNumbering = new();
-
-    private void LoadNumberingDefinitions(Stream docxStream)
-    {
-        _numIdToAbstractId.Clear();
-        _abstractNumbering.Clear();
-
-        try
-        {
-            using (var archive = new ZipArchive(docxStream, ZipArchiveMode.Read, true))
-            {
-                var entry = archive.GetEntry("word/numbering.xml");
-                if (entry == null) return;
-
-                using (var stream = entry.Open())
-                {
-                    var doc = XDocument.Load(stream);
-                    XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-                    foreach (var abstractNum in doc.Descendants(w + "abstractNum"))
-                    {
-                        var idVal = abstractNum.Attribute(w + "abstractNumId")?.Value;
-                        if (!int.TryParse(idVal, out int id)) continue;
-
-                        var def = new NumberingDefinition { AbstractNumId = id };
-                        foreach (var lvl in abstractNum.Descendants(w + "lvl"))
-                        {
-                            var ilvlVal = lvl.Attribute(w + "ilvl")?.Value;
-                            if (!int.TryParse(ilvlVal, out int ilvl)) continue;
-
-                            var level = new NumberingLevel
-                            {
-                                LevelIndex = ilvl,
-                                Start = lvl.Element(w + "start")?.Attribute(w + "val")?.Value ?? "1",
-                                NumberFormat = lvl.Element(w + "numFmt")?.Attribute(w + "val")?.Value ?? "decimal",
-                                LevelText = lvl.Element(w + "lvlText")?.Attribute(w + "val")?.Value ?? ""
-                            };
-
-                            var pPr = lvl.Element(w + "pPr");
-                            if (pPr != null)
-                            {
-                                var ind = pPr.Element(w + "ind");
-                                if (ind != null)
-                                {
-                                    if (float.TryParse(ind.Attribute(w + "left")?.Value, out float left)) level.Indent = left * TWIPS_TO_POINTS;
-                                    if (float.TryParse(ind.Attribute(w + "hanging")?.Value, out float hanging)) level.Hanging = hanging * TWIPS_TO_POINTS;
-                                }
-                            }
-                            def.Levels[ilvl] = level;
-                        }
-                        _abstractNumbering[id] = def;
-                    }
-
-                    foreach (var num in doc.Descendants(w + "num"))
-                    {
-                        var idVal = num.Attribute(w + "numId")?.Value;
-                        var abstractIdVal = num.Element(w + "abstractNumId")?.Attribute(w + "val")?.Value;
-
-                        if (int.TryParse(idVal, out int id) && int.TryParse(abstractIdVal, out int abstractId))
-                        {
-                            _numIdToAbstractId[id] = abstractId;
-                        }
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to load numbering definitions: {ex.Message}");
-        }
-    }
-
-    private Dictionary<int, Dictionary<int, int>> _numCounters = new();
-
-    private struct SectionProperties
-    {
-        public bool TitlePg;
-        public string? HeaderId;
-        public string? FirstPageHeaderId;
-        public string? FooterId;
-        public string? FirstPageFooterId;
-    }
-
-    private SectionProperties _sectionProps;
-    private Dictionary<string, string> _headerFooterContent = new();
-
-    private void LoadSectionProperties(Stream docxStream)
-    {
-        _sectionProps = new SectionProperties();
-        _headerFooterContent.Clear();
-
-        try
-        {
-            using (var archive = new ZipArchive(docxStream, ZipArchiveMode.Read, true))
-            {
-                var documentEntry = archive.GetEntry("word/document.xml");
-                if (documentEntry == null) return;
-
-                using (var stream = documentEntry.Open())
-                {
-                    var doc = XDocument.Load(stream);
-                    XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-                    XNamespace r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-
-                    var sectPr = doc.Descendants(w + "sectPr").LastOrDefault();
-                    if (sectPr != null)
-                    {
-                        _sectionProps.TitlePg = sectPr.Element(w + "titlePg") != null;
-
-                        foreach (var hdr in sectPr.Elements(w + "headerReference"))
-                        {
-                            var type = hdr.Attribute(w + "type")?.Value;
-                            var id = hdr.Attribute(r + "id")?.Value;
-                            if (type == "default") _sectionProps.HeaderId = id;
-                            else if (type == "first") _sectionProps.FirstPageHeaderId = id;
-                        }
-
-                        foreach (var ftr in sectPr.Elements(w + "footerReference"))
-                        {
-                            var type = ftr.Attribute(w + "type")?.Value;
-                            var id = ftr.Attribute(r + "id")?.Value;
-                            if (type == "default") _sectionProps.FooterId = id;
-                            else if (type == "first") _sectionProps.FirstPageFooterId = id;
-                        }
-                    }
-                }
-
-                var relsEntry = archive.GetEntry("word/_rels/document.xml.rels");
-                if (relsEntry != null)
-                {
-                    using (var relsStream = relsEntry.Open())
-                    {
-                        var relsDoc = XDocument.Load(relsStream);
-                        XNamespace relsNs = "http://schemas.openxmlformats.org/package/2006/relationships";
-
-                        var relMap = relsDoc.Descendants(relsNs + "Relationship")
-                            .ToDictionary(x => x.Attribute("Id")?.Value ?? "", x => x.Attribute("Target")?.Value ?? "");
-
-                        LoadHdrFtrContent(archive, relMap, _sectionProps.HeaderId);
-                        LoadHdrFtrContent(archive, relMap, _sectionProps.FirstPageHeaderId);
-                        LoadHdrFtrContent(archive, relMap, _sectionProps.FooterId);
-                        LoadHdrFtrContent(archive, relMap, _sectionProps.FirstPageFooterId);
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to load section properties: {ex.Message}");
-        }
-    }
-
-    private void LoadHdrFtrContent(ZipArchive archive, Dictionary<string, string> relMap, string? id)
-    {
-        if (string.IsNullOrEmpty(id) || !relMap.TryGetValue(id, out var target)) return;
-
-        var path = target.StartsWith("/") ? target.Substring(1) : "word/" + target;
-        var entry = archive.GetEntry(path);
-        if (entry == null) return;
-
-        using (var stream = entry.Open())
-        {
-            var doc = XDocument.Load(stream);
-            XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-            var text = string.Join(" ", doc.Descendants(w + "t").Select(t => t.Value));
-            if (!string.IsNullOrWhiteSpace(text))
-            {
-                _headerFooterContent[id] = text;
-            }
-        }
-    }
-
-    private void RenderListItem(ColumnDescriptor column, Paragraph paragraph)
-    {
-        int numId = paragraph.Xml?.Descendants(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "numPr")
-                             .Elements(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "numId")
-                             .Select(e => int.TryParse(e.Attribute(XNamespace.Get("http://schemas.openxmlformats.org/wordprocessingml/2006/main") + "val")?.Value, out int id) ? id : 0)
-                             .FirstOrDefault() ?? 0;
-
-        int ilvl = paragraph.IndentLevel ?? 0;
-
-        NumberingLevel? lvlDef = null;
-        if (numId > 0 && _numIdToAbstractId.TryGetValue(numId, out int abstractId))
-        {
-            if (_abstractNumbering.TryGetValue(abstractId, out var def) && def.Levels.TryGetValue(ilvl, out var level))
-            {
-                lvlDef = level;
-            }
-        }
-
-        int counter = 1;
-        if (numId > 0)
-        {
-            if (!_numCounters.ContainsKey(numId)) _numCounters[numId] = new();
-            if (!_numCounters[numId].ContainsKey(ilvl)) _numCounters[numId][ilvl] = 0;
-            _numCounters[numId][ilvl]++;
-            counter = _numCounters[numId][ilvl];
-
-            for (int i = ilvl + 1; i < 10; i++)
-            {
-                if (_numCounters[numId].ContainsKey(i)) _numCounters[numId][i] = 0;
-            }
-        }
-
-        string marker = GetListMarker(lvlDef, counter);
-        float indent = lvlDef?.Indent ?? (ilvl * 20f);
-        float hanging = lvlDef?.Hanging ?? 15f;
-
-        // FIXED: Better list spacing
-        column.Item().PaddingTop(4).PaddingBottom(4).PaddingLeft(indent).Row(row =>
-        {
-            row.ConstantItem(hanging).Text(marker).FontSize(11);
-            row.RelativeItem().Text(text =>
-            {
-                ProcessTextRuns(text, paragraph);
-                ApplyAlignment(text, paragraph.Alignment);
-            });
-        });
-    }
-
-    private string GetListMarker(NumberingLevel? lvl, int counter)
-    {
-        if (lvl == null) return "•";
-
-        var format = lvl.NumberFormat;
-        var text = lvl.LevelText;
-
-        if (format == "bullet")
-        {
-            if (text == "o") return "○";
-            if (text == "·") return "•";
-            if (text == "§") return "▪";
-            // Characters in Unicode private use area are from symbol fonts - use standard bullet
-            if (text.Length > 0 && text[0] >= 0xF000) return "•";
-            if (string.IsNullOrEmpty(text)) return "•";
-            return "•";
-        }
-
-        string value = counter.ToString();
-        if (format == "lowerLetter") value = ((char)('a' + (counter - 1))).ToString();
-        else if (format == "upperLetter") value = ((char)('A' + (counter - 1))).ToString();
-        else if (format == "lowerRoman") value = ToRoman(counter).ToLower();
-        else if (format == "upperRoman") value = ToRoman(counter);
-
-        if (!string.IsNullOrEmpty(text))
-        {
-            return text.Replace($"%{lvl.LevelIndex + 1}", value);
-        }
-
-        return value + ".";
-    }
-
-    private string ToRoman(int number)
-    {
-        if (number <= 0) return number.ToString();
-        if (number >= 1000) return "M" + ToRoman(number - 1000);
-        if (number >= 900) return "CM" + ToRoman(number - 900);
-        if (number >= 500) return "D" + ToRoman(number - 500);
-        if (number >= 400) return "CD" + ToRoman(number - 400);
-        if (number >= 100) return "C" + ToRoman(number - 100);
-        if (number >= 90) return "XC" + ToRoman(number - 90);
-        if (number >= 50) return "L" + ToRoman(number - 50);
-        if (number >= 40) return "XL" + ToRoman(number - 40);
-        if (number >= 10) return "X" + ToRoman(number - 10);
-        if (number >= 9) return "IX" + ToRoman(number - 9);
-        if (number >= 5) return "V" + ToRoman(number - 5);
-        if (number >= 4) return "IV" + ToRoman(number - 4);
-        if (number >= 1) return "I" + ToRoman(number - 1);
-        return string.Empty;
-    }
-
-    /// <summary>
-    /// Pre-compute row spans for vertical merges so QuestPDF can render them correctly.
-    /// Returns a dictionary mapping (rowIndex, gridCol) to the number of rows spanned.
-    /// </summary>
-    private Dictionary<(int row, int col), int> ComputeVerticalMergeSpans(Table table, int totalGridColumns)
-    {
-        var spans = new Dictionary<(int, int), int>();
-        var occupancy = new bool[table.Rows.Count + 1, totalGridColumns + 1];
-        var restartRow = new Dictionary<int, int>(); // gridCol (1-based) -> starting row (0-based)
-
-        for (int rowIndex = 0; rowIndex < table.Rows.Count; rowIndex++)
-        {
-            int gridCol = 1;
-            for (int cellIndex = 0; cellIndex < table.Rows[rowIndex].Cells.Count; cellIndex++)
-            {
-                while (gridCol <= totalGridColumns && occupancy[rowIndex + 1, gridCol])
-                    gridCol++;
-                if (gridCol > totalGridColumns) break;
-
-                var style = ExtractCellStyle(table.Rows[rowIndex].Cells[cellIndex]);
-
-                for (int s = 0; s < style.GridSpan; s++)
-                {
-                    if (gridCol + s <= totalGridColumns)
-                        occupancy[rowIndex + 1, gridCol + s] = true;
-                }
-
-                if (style.IsVerticalMergeRestart)
-                {
-                    restartRow[gridCol] = rowIndex;
-                    spans[(rowIndex, gridCol)] = 1;
-                }
-                else if (style.IsVerticalMergeContinue)
-                {
-                    if (restartRow.TryGetValue(gridCol, out int startRow))
-                    {
-                        spans[(startRow, gridCol)]++;
-                    }
-                }
-                else
-                {
-                    restartRow.Remove(gridCol);
-                }
-
-                gridCol += style.GridSpan;
-            }
-        }
-
-        return spans;
-    }
-
-    /// <summary>
-    /// FIXED: Improved table rendering with gridCol widths, vertical merge RowSpan,
-    /// better handling of empty cells, and borderless table detection.
-    /// </summary>
-    private void RenderTable(ColumnDescriptor parentColumn, Table table)
-    {
-        if (table.Rows.Count == 0) return;
-
-        XNamespace wt = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-        // Read grid column widths from table XML for proportional sizing
-        var gridColWidths = new List<float>();
-        var tblGrid = table.Xml?.Element(wt + "tblGrid");
-        if (tblGrid != null)
-        {
-            foreach (var gc in tblGrid.Elements(wt + "gridCol"))
-            {
-                if (float.TryParse(gc.Attribute(wt + "w")?.Value, out float cw))
-                    gridColWidths.Add(cw);
-                else
-                    gridColWidths.Add(1f);
-            }
-        }
-
-        // Calculate total columns - prefer gridCol count, fallback to first row
-        int totalGridColumns = gridColWidths.Count > 0
-            ? gridColWidths.Count
-            : table.Rows[0].Cells.Sum(c => ExtractCellStyle(c).GridSpan);
-        if (totalGridColumns <= 0) return;
-
-        // Detect tables that should be borderless
-        bool isBorderlessTable = ShouldTableBeBorderless(table);
-
-        // Pre-compute vertical merge spans
-        var vMergeSpans = ComputeVerticalMergeSpans(table, totalGridColumns);
-
-        parentColumn.Item().Table(tableElement =>
-        {
-            // Set up columns with actual widths from Word XML
-            tableElement.ColumnsDefinition(columns =>
-            {
-                if (gridColWidths.Count == totalGridColumns)
-                {
-                    foreach (var cw in gridColWidths)
-                        columns.RelativeColumn(Math.Max(cw, 1f));
-                }
-                else
-                {
-                    for (int i = 0; i < totalGridColumns; i++)
-                        columns.RelativeColumn();
-                }
-            });
-
-            // Track cell occupancy
-            var occupancy = new bool[table.Rows.Count + 1, totalGridColumns + 1];
-
-            for (int rowIndex = 0; rowIndex < table.Rows.Count; rowIndex++)
-            {
-                var row = table.Rows[rowIndex];
-                int currentGridCol = 1;
-
-                for (int cellIndex = 0; cellIndex < row.Cells.Count; cellIndex++)
-                {
-                    var cell = row.Cells[cellIndex];
-                    var style = ExtractCellStyle(cell);
-
-                    // Find next available column
-                    while (currentGridCol <= totalGridColumns && occupancy[rowIndex + 1, currentGridCol])
-                    {
-                        currentGridCol++;
-                    }
-                    if (currentGridCol > totalGridColumns) break;
-
-                    // Skip continued vertical merges (content comes from the restart cell)
-                    if (style.IsVerticalMergeContinue)
-                    {
-                        for (int i = 0; i < style.GridSpan; i++)
-                        {
-                            if (currentGridCol + i <= totalGridColumns)
-                                occupancy[rowIndex + 1, currentGridCol + i] = true;
-                        }
-                        currentGridCol += style.GridSpan;
-                        continue;
-                    }
-
-                    // Mark occupancy
-                    for (int i = 0; i < style.GridSpan; i++)
-                    {
-                        if (currentGridCol + i <= totalGridColumns)
-                            occupancy[rowIndex + 1, currentGridCol + i] = true;
-                    }
-
-                    // Render cell with position and span
-                    var cellElement = tableElement.Cell()
-                        .Row((uint)(rowIndex + 1))
-                        .Column((uint)currentGridCol)
-                        .ColumnSpan((uint)style.GridSpan);
-
-                    // Apply RowSpan for vertical merges
-                    if (style.IsVerticalMergeRestart &&
-                        vMergeSpans.TryGetValue((rowIndex, currentGridCol), out int rowSpan) &&
-                        rowSpan > 1)
-                    {
-                        cellElement = cellElement.RowSpan((uint)rowSpan);
-                    }
-
-                    QuestPDF.Infrastructure.IContainer container = cellElement;
-
-                    // Apply borders - skip for borderless tables
-                    if (!isBorderlessTable)
-                    {
-                        if (style.TopBorderSize > 0)
-                            container = container.BorderTop(style.TopBorderSize).BorderColor("#" + style.TopBorderColor);
-                        if (style.BottomBorderSize > 0)
-                            container = container.BorderBottom(style.BottomBorderSize).BorderColor("#" + style.BottomBorderColor);
-                        if (style.LeftBorderSize > 0)
-                            container = container.BorderLeft(style.LeftBorderSize).BorderColor("#" + style.LeftBorderColor);
-                        if (style.RightBorderSize > 0)
-                            container = container.BorderRight(style.RightBorderSize).BorderColor("#" + style.RightBorderColor);
-                    }
-
-                    container.Padding(6).Column(cellColumn =>
-                    {
-                        if (cell.Paragraphs.Count == 0)
-                        {
-                            cellColumn.Item().Text(" ");
-                        }
-                        else
-                        {
-                            foreach (var cellParagraph in cell.Paragraphs)
-                            {
-                                var cellText = cellParagraph.Text?.Trim() ?? "";
-
-                                if (string.IsNullOrWhiteSpace(cellText))
-                                {
-                                    cellColumn.Item().Height(4);
-                                    continue;
-                                }
-
-                                bool isBold = cellParagraph.MagicText.Any(r => r.formatting?.Bold == true);
-                                bool isShort = cellText.Length < 40;
-
-                                if (isBold && isShort)
-                                {
-                                    cellColumn.Item().PaddingBottom(2).Text(text =>
-                                    {
-                                        ProcessTextRuns(text, cellParagraph);
-                                        ApplyAlignment(text, cellParagraph.Alignment);
-                                    });
-                                }
-                                else
-                                {
-                                    cellColumn.Item().Text(text =>
-                                    {
-                                        ProcessTextRuns(text, cellParagraph);
-                                        ApplyAlignment(text, cellParagraph.Alignment);
-                                    });
-                                }
-                            }
-                        }
-                    });
-
-                    currentGridCol += style.GridSpan;
-                }
-            }
-        });
-    }
-
-    /// <summary>
-    /// ISSUE 1: Detect tables that should be borderless
-    /// - INSURED/POLICY info tables (contain INSURED:, POLICY NUMBER:, PERIOD OF, FROM:, TO:)
-    /// - Prepared by/Reviewed by footer tables
-    /// </summary>
-    private bool ShouldTableBeBorderless(Table table)
-    {
-        // Get all text content from the table
-        var tableText = string.Join(" ", table.Paragraphs.Select(p => p.Text?.Trim() ?? "")).ToUpperInvariant();
-
-        // Check for INSURED/POLICY info table patterns
-        bool isInsuredPolicyTable =
-            (tableText.Contains("INSURED:") || tableText.Contains("INSURED :")) &&
-            (tableText.Contains("POLICY") || tableText.Contains("PERIOD OF"));
-
-        // Check for Prepared by/Reviewed by table
-        bool isPreparedByTable =
-            tableText.Contains("PREPARED BY") ||
-            tableText.Contains("REVIEWED BY");
-
-        return isInsuredPolicyTable || isPreparedByTable;
-    }
-
-    private void ProcessBorder(XElement? border, out float size, out string color)
-    {
-        size = 0;
-        color = "000000";
-
-        if (border == null) return;
-
-        XNamespace w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-
-        var sz = border.Attribute(w + "sz")?.Value;
-        if (float.TryParse(sz, out float szVal))
-        {
-            size = szVal / 8f; // Border size in eighths of a point
-        }
-
-        var col = border.Attribute(w + "color")?.Value;
-        if (!string.IsNullOrEmpty(col) && col != "auto")
-        {
-            color = col;
-        }
-    }
-
-    private void RenderParagraph(ColumnDescriptor column, Paragraph paragraph)
-    {
-        var style = ExtractParagraphStyle(paragraph);
-
-        // FIXED: Better default spacing for all paragraphs
-        float paddingTop = style.SpacingBefore ?? 4;
-        float paddingBottom = style.SpacingAfter ?? 4;
-
-        // ISSUE 7 FIX: Apply 1.5 line spacing for policy conditions section
-        if (_inPolicyConditions)
-        {
-            paddingBottom = Math.Max(paddingBottom, 12); // 1.5 line spacing
-        }
-
-        var item = column.Item()
-            .PaddingTop(paddingTop)
-            .PaddingBottom(paddingBottom)
-            .PaddingLeft(style.LeftIndent)
-            .PaddingRight(style.RightIndent);
-
-        item.Text(text =>
-        {
-            ProcessTextRuns(text, paragraph);
-            ApplyAlignment(text, style.Alignment);
-        });
-
-        _hasContentSincePageBreak = true;
-    }
-
-    private void ProcessImage(ColumnDescriptor column, DocX wordDocument, string imageId, float? width, float? height)
-    {
-         _imageCount++;
-
-         var imagePart = wordDocument.Images.FirstOrDefault(img => img.Id == imageId);
-         if (imagePart != null)
-         {
-             using var stream = imagePart.GetStream(FileMode.Open, FileAccess.Read);
-             using var memoryStream = new MemoryStream();
-             stream.CopyTo(memoryStream);
-             var imageBytes = memoryStream.ToArray();
-
-             if (imageBytes.Length > 0)
-             {
-                 // ISSUE 6 FIX: Signature images (2nd image onwards) should be smaller
-                 bool isSignatureImage = _imageCount >= 2;
-
-                 var imgContainer = column.Item()
-                     .PaddingVertical(isSignatureImage ? 5 : 10);
-
-                 if (isSignatureImage)
-                 {
-                     // Signature image: smaller and centered
-                     imgContainer = imgContainer.AlignCenter();
-                     imgContainer = imgContainer.MaxWidth(80).MaxHeight(80);
-                 }
-                 else
-                 {
-                     imgContainer = imgContainer.AlignCenter();
-                     if (width.HasValue && width.Value > 0)
-                         imgContainer = imgContainer.MaxWidth(Math.Min(width.Value, 400));
-                     else
-                         imgContainer = imgContainer.MaxWidth(200);
-                 }
-
-                 imgContainer.Image(imageBytes);
-             }
-         }
-    }
-
-    private void RenderImportantBox(ColumnDescriptor column, List<Paragraph> paragraphs)
-    {
-        column.Item()
-            .PaddingVertical(20)
-            .Background(Colors.Grey.Lighten4)
-            .Border(1.5f)
-            .BorderColor(Colors.Grey.Darken2)
-            .Padding(24)
-            .Column(boxColumn =>
-            {
-                foreach (var p in paragraphs)
-                {
-                    var text = p.Text?.Trim() ?? string.Empty;
-                    if (string.IsNullOrEmpty(text)) continue;
-
-                    if (text.Equals("IMPORTANT", StringComparison.OrdinalIgnoreCase))
-                    {
-                        boxColumn.Item().PaddingBottom(16).AlignCenter().Text(t =>
-                        {
-                            t.Span("IMPORTANT").Bold().FontSize(16);
-                        });
-                    }
-                    else if (text.Contains("ZENITH GENERAL INSURANCE", StringComparison.OrdinalIgnoreCase))
-                    {
-                        boxColumn.Item().PaddingTop(10).AlignCenter().Text(t =>
-                        {
-                            t.Span(text).Bold().FontSize(12);
-                        });
-                    }
-                    else if (text.StartsWith("OFFICE:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        boxColumn.Item().PaddingTop(4).AlignCenter().Text(t => t.Span(text).FontSize(10));
-                    }
-                    else if (text.Contains("CIVIC TOWERS", StringComparison.OrdinalIgnoreCase) ||
-                             text.Contains("OZUMBA MBADIWE", StringComparison.OrdinalIgnoreCase) ||
-                             text.Contains("VICTORIA ISLAND", StringComparison.OrdinalIgnoreCase) ||
-                             text.Contains("LAGOS", StringComparison.OrdinalIgnoreCase))
-                    {
-                        boxColumn.Item().AlignCenter().Text(t => t.Span(text).FontSize(10));
-                    }
-                    else if (text.StartsWith("Tel:", StringComparison.OrdinalIgnoreCase) ||
-                             text.Contains("Fax:", StringComparison.OrdinalIgnoreCase))
-                    {
-                        boxColumn.Item().PaddingTop(2).AlignCenter().Text(t => t.Span(text).FontSize(10));
-                    }
-                    else
-                    {
-                        boxColumn.Item().PaddingBottom(6).AlignCenter().Text(t =>
-                        {
-                            ProcessTextRunsForBox(t, p);
-                        });
-                    }
-                }
-            });
-    }
-
-    private void ProcessTextRunsForBox(TextDescriptor text, Paragraph paragraph)
-    {
-        foreach (var run in paragraph.MagicText)
-        {
-            if (string.IsNullOrEmpty(run.text)) continue;
-
-            var style = ExtractRunStyle(run);
-            var span = text.Span(run.text);
-
-            if (style.Bold) span.Bold();
-            if (style.Italic) span.Italic();
-            if (style.Underline) span.Underline();
-
-            if (style.FontSize.HasValue) span.FontSize(style.FontSize.Value);
-            else span.FontSize(11);
-
-            if (!string.IsNullOrEmpty(style.FontName) && !SymbolFonts.Contains(style.FontName)) span.FontFamily(style.FontName);
-            if (!string.IsNullOrEmpty(style.Color)) span.FontColor("#" + style.Color);
-        }
-    }
-
-    private void ApplyAlignment(TextDescriptor text, Alignment? alignment)
-    {
-        switch (alignment)
-        {
-            case Alignment.left:
-                text.AlignLeft();
-                break;
-            case Alignment.center:
-                text.AlignCenter();
-                break;
-            case Alignment.right:
-                text.AlignRight();
-                break;
-            case Alignment.both:
-                text.Justify();
-                break;
-            default:
-                text.AlignLeft();
-                break;
-        }
-    }
-
-    private void ProcessTextRuns(TextDescriptor text, Paragraph paragraph)
-    {
-        foreach (var run in paragraph.MagicText)
-        {
-            if (string.IsNullOrEmpty(run.text)) continue;
-
-            var style = ExtractRunStyle(run);
-            var textParts = run.text.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
-
-            for (int i = 0; i < textParts.Length; i++)
-            {
-                if (i > 0) text.Span("\n");
-
-                var part = textParts[i];
-                if (string.IsNullOrEmpty(part)) continue;
-
-                var hyperlink = paragraph.Hyperlinks?.FirstOrDefault(h =>
-                    !string.IsNullOrEmpty(h.Text) && h.Text.Contains(part));
-
-                if (hyperlink != null && hyperlink.Uri != null)
-                {
-                    try
-                    {
-                        var uriString = hyperlink.Uri.ToString();
-                        if (!string.IsNullOrEmpty(uriString))
-                        {
-                            var linkSpan = text.Hyperlink(part, uriString);
-                            linkSpan.FontColor(Colors.Blue.Darken1);
-                            linkSpan.Underline();
-
-                            if (style.Bold) linkSpan.Bold();
-                            if (style.Italic) linkSpan.Italic();
-                            if (style.FontSize.HasValue) linkSpan.FontSize(style.FontSize.Value);
-                            if (!string.IsNullOrEmpty(style.FontName) && !SymbolFonts.Contains(style.FontName)) linkSpan.FontFamily(style.FontName);
-
-                            continue;
-                        }
-                    }
-                    catch { }
-                }
-
-                var span = text.Span(part);
-
-                if (style.Bold) span.Bold();
-                if (style.Italic) span.Italic();
-                if (style.Underline) span.Underline();
-
-                if (style.FontSize.HasValue)
-                {
-                    span.FontSize(style.FontSize.Value);
-                }
-
-                if (!string.IsNullOrEmpty(style.FontName) && !SymbolFonts.Contains(style.FontName))
-                {
-                    span.FontFamily(style.FontName);
-                }
-
-                if (!string.IsNullOrEmpty(style.Color))
-                {
-                    var hex = style.Color;
-                    if (hex.Length == 6 || hex.Length == 8)
-                    {
-                         span.FontColor("#" + hex);
-                    }
-                }
-            }
-        }
+        // Fallback: assume it's on PATH
+        return OperatingSystem.IsWindows() ? "soffice.exe" : "libreoffice";
     }
 }
 
 /// <summary>
-/// Result of a Word to PDF conversion
+/// Result of a conversion operation
 /// </summary>
 public class ConversionResult
 {
     public bool Success { get; set; }
-    public string Message { get; set; } = string.Empty;
+    public string? Message { get; set; }
     public string? PdfPath { get; set; }
+    public string? FileName { get; set; }
+    public string? PolicyNumber { get; set; }
     public string? Error { get; set; }
-    public string InsuredName { get; set; } = string.Empty;
-    public string PolicyNumber { get; set; } = string.Empty;
 }

@@ -1,21 +1,15 @@
 {
   "version": 2,
-  "dgSpecHash": "/euuxHi7E9g=",
+  "dgSpecHash": "u20+Itbydrs=",
   "success": true,
   "projectFilePath": "/home/bluebird/coding_folder/backend/word_2_pdf/word_2_pdf.csproj",
   "expectedPackageFiles": [
-    "/home/bluebird/.nuget/packages/docx/5.0.0/docx.5.0.0.nupkg.sha512",
     "/home/bluebird/.nuget/packages/microsoft.extensions.apidescription.server/6.0.5/microsoft.extensions.apidescription.server.6.0.5.nupkg.sha512",
     "/home/bluebird/.nuget/packages/microsoft.openapi/1.2.3/microsoft.openapi.1.2.3.nupkg.sha512",
-    "/home/bluebird/.nuget/packages/questpdf/2025.12.3/questpdf.2025.12.3.nupkg.sha512",
-    "/home/bluebird/.nuget/packages/skiasharp/2.88.8/skiasharp.2.88.8.nupkg.sha512",
-    "/home/bluebird/.nuget/packages/skiasharp.nativeassets.macos/2.88.8/skiasharp.nativeassets.macos.2.88.8.nupkg.sha512",
-    "/home/bluebird/.nuget/packages/skiasharp.nativeassets.win32/2.88.8/skiasharp.nativeassets.win32.2.88.8.nupkg.sha512",
     "/home/bluebird/.nuget/packages/swashbuckle.aspnetcore/6.5.0/swashbuckle.aspnetcore.6.5.0.nupkg.sha512",
     "/home/bluebird/.nuget/packages/swashbuckle.aspnetcore.swagger/6.5.0/swashbuckle.aspnetcore.swagger.6.5.0.nupkg.sha512",
     "/home/bluebird/.nuget/packages/swashbuckle.aspnetcore.swaggergen/6.5.0/swashbuckle.aspnetcore.swaggergen.6.5.0.nupkg.sha512",
     "/home/bluebird/.nuget/packages/swashbuckle.aspnetcore.swaggerui/6.5.0/swashbuckle.aspnetcore.swaggerui.6.5.0.nupkg.sha512",
-    "/home/bluebird/.nuget/packages/system.io.packaging/4.5.0/system.io.packaging.4.5.0.nupkg.sha512",
     "/home/bluebird/.nuget/packages/microsoft.netcore.app.ref/8.0.22/microsoft.netcore.app.ref.8.0.22.nupkg.sha512",
     "/home/bluebird/.nuget/packages/microsoft.aspnetcore.app.ref/8.0.22/microsoft.aspnetcore.app.ref.8.0.22.nupkg.sha512",
     "/home/bluebird/.nuget/packages/microsoft.netcore.app.host.linux-x64/8.0.22/microsoft.netcore.app.host.linux-x64.8.0.22.nupkg.sha512"

@@ -8,8 +8,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="DocX" Version="5.0.0" />
-    <PackageReference Include="QuestPDF" Version="2025.12.3" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
   </ItemGroup>
 
